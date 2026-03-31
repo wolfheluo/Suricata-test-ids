@@ -36,6 +36,9 @@ def analyze_pcap(pcap_path: str) -> bool:
     rules_file = os.path.join(config.RULES_DIR, "emerging-all.rules")
     if os.path.exists(rules_file):
         cmd += ["-S", rules_file]
+    local_rules = os.path.join(config.RULES_DIR, "local.rules")
+    if os.path.exists(local_rules):
+        cmd += ["-S", local_rules]
 
     log.info("Running: %s", " ".join(cmd))
 
@@ -332,6 +335,9 @@ def reanalyze_pcap(pcap_path: str) -> bool:
     rules_file = os.path.join(config.RULES_DIR, "emerging-all.rules")
     if os.path.exists(rules_file):
         cmd += ["-S", rules_file]
+    local_rules = os.path.join(config.RULES_DIR, "local.rules")
+    if os.path.exists(local_rules):
+        cmd += ["-S", local_rules]
 
     log.info("Re-analyzing: %s", " ".join(cmd))
 

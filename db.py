@@ -111,7 +111,7 @@ def upsert_alert(a: dict) -> int:
                 (now, row["id"]),
             )
             return row["id"]
-        c.execute(
+        cur = c.execute(
             """INSERT INTO alerts
                (timestamp,src_ip,dst_ip,src_port,dst_port,proto,
                 signature_id,signature,category,severity,priority,
@@ -125,7 +125,7 @@ def upsert_alert(a: dict) -> int:
                 a.get("source_pcap"), a.get("forensic_pcap"), a.get("country"), now,
             ),
         )
-        return c.lastrowid
+        return cur.lastrowid
 
 
 def update_alert_forensic(alert_id: int, forensic_filename: str):
