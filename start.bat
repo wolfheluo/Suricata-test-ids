@@ -51,7 +51,7 @@ if exist "%GEOIP_DB%" (
     echo   [OK]  GeoLite2-City.mmdb : %GEOIP_DB%
 ) else (
     echo   [--]  GeoLite2-City.mmdb : 未找到（國別查詢將顯示 N/A）
-    echo         可至 https://dev.maxmind.com/geoip/geolite2-free-geolocation-data 下載
+    echo         可至 https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-City.mmdb 下載
     echo         並將 GeoLite2-City.mmdb 放置於專案根目錄（非必要，可繼續啟動）
 )
 

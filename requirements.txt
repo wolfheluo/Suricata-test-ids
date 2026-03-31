@@ -1,4 +1,4 @@
-Flask>=3.0.0
-watchdog>=4.0.0
-geoip2>=4.8.0
-ijson>=3.2.0
+Flask
+watchdog
+geoip2
+ijson
