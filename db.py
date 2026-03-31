@@ -231,3 +231,9 @@ def get_pcaps():
 def delete_pcap(filename: str):
     with _lock, _conn() as c:
         c.execute("DELETE FROM pcap_files WHERE filename=?", (filename,))
+
+
+def delete_alerts_by_source(source_pcap: str):
+    """Delete all alerts whose source_pcap matches *source_pcap* (basename)."""
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM alerts WHERE source_pcap=?", (source_pcap,))

@@ -236,3 +236,72 @@ def _safe_remove(path: str):
         os.remove(path)
     except OSError as e:
         log.warning("Could not delete %s: %s", path, e)
+
+
+# ── re-analysis of an already-stored PCAP ─────────────────────────────────────
+
+def reanalyze_pcap(pcap_path: str) -> bool:
+    """
+    Re-analyze a PCAP that is already stored in forensics/.
+    Clears the old Suricata log directory and old DB alerts, then
+    runs a fresh Suricata analysis.  The file is NOT moved.
+    """
+    basename  = os.path.basename(pcap_path)
+    pcap_name = os.path.splitext(basename)[0]
+    log_dir   = os.path.join(config.LOGS_DIR, pcap_name)
+
+    # Start fresh: remove old Suricata output
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Remove old alerts for this PCAP
+    db.delete_alerts_by_source(basename)
+
+    # Build Suricata command (same logic as analyze_pcap)
+    cmd = [config.SURICATA_BIN, "-r", pcap_path, "-l", log_dir, "-k", "none"]
+    rules_file = os.path.join(config.RULES_DIR, "emerging-all.rules")
+    if os.path.exists(rules_file):
+        cmd += ["-S", rules_file]
+
+    log.info("Re-analyzing: %s", " ".join(cmd))
+
+    env = os.environ.copy()
+    extra = os.pathsep.join(filter(None, [
+        config.SURICATA_DIR,
+        config.NPCAP_DIR if os.path.isdir(config.NPCAP_DIR) else "",
+    ]))
+    env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600, check=False,
+            cwd=config.SURICATA_DIR, env=env,
+        )
+        if result.returncode != 0:
+            log.warning("Suricata exited with code %d. stderr: %s",
+                        result.returncode, result.stderr[:500])
+    except subprocess.TimeoutExpired:
+        log.error("Suricata timed out on %s", pcap_path)
+        return False
+    except FileNotFoundError:
+        log.error("Suricata binary not found: %s", config.SURICATA_BIN)
+        return False
+
+    fast_log = os.path.join(log_dir, "fast.log")
+    eve_log  = os.path.join(log_dir, "eve.json")
+
+    has_high = _check_high_priority(fast_log)
+
+    if not has_high:
+        log.info("Re-analyze: no Priority 1/2 alerts in %s", pcap_name)
+        db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0)
+        return False
+
+    alerts = _parse_eve_json(eve_log)
+    log.info("Re-analyze: %d alerts found in %s", len(alerts), pcap_name)
+    for alert in alerts:
+        _process_alert(alert, pcap_path)
+
+    db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), len(alerts))
+    return True

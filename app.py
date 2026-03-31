@@ -5,6 +5,7 @@ URL:  http://127.0.0.1:5000
 """
 import os
 import subprocess
+import threading
 import urllib.request
 import logging
 
@@ -13,6 +14,7 @@ from flask import (Flask, render_template, jsonify, request,
 
 import config
 import db
+import analyzer
 import geoip_service
 from watcher import CaptureWatcher
 
@@ -191,6 +193,17 @@ def api_pcap_delete(filename):
         os.remove(path)
     db.delete_pcap(safe)
     return jsonify({"ok": True})
+
+@app.route("/api/pcap/<filename>/reanalyze", methods=["POST"])
+def api_pcap_reanalyze(filename):
+    safe = os.path.basename(filename)
+    path = os.path.join(config.FORENSICS_DIR, safe)
+    if not os.path.exists(path):
+        abort(404)
+    def _run():
+        analyzer.reanalyze_pcap(path)
+    threading.Thread(target=_run, daemon=True, name=f"reanalyze-{safe}").start()
+    return jsonify({"queued": True})
 
 @app.route("/api/pcap/batch_delete", methods=["POST"])
 def api_pcap_batch_delete():

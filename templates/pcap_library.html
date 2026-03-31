@@ -71,8 +71,9 @@ function loadPcaps() {
         <td>${f.alert_count||0}</td>
         <td class="small">${f.created_at||''}</td>
         <td>
-          <button class="btn btn-sm btn-outline-info py-0"   onclick="previewPcap('${f.filename}')"><i class="bi bi-eye"></i></button>
-          <a      class="btn btn-sm btn-outline-primary py-0" href="/api/pcap/${encodeURIComponent(f.filename)}/download"><i class="bi bi-download"></i></a>
+          <button class="btn btn-sm btn-outline-info py-0"    onclick="previewPcap('${f.filename}')"><i class="bi bi-eye"></i></button>
+          <a      class="btn btn-sm btn-outline-primary py-0"  href="/api/pcap/${encodeURIComponent(f.filename)}/download"><i class="bi bi-download"></i></a>
+          <button class="btn btn-sm btn-outline-warning py-0" onclick="reanalyzePcap(this,'${f.filename}')" title="以最新規則重新分析"><i class="bi bi-arrow-repeat"></i></button>
           <button class="btn btn-sm btn-outline-danger py-0"  onclick="deletePcap('${f.filename}')"><i class="bi bi-trash"></i></button>
         </td>
       </tr>`;
@@ -94,6 +95,30 @@ function previewPcap(filename) {
 function deletePcap(filename) {
   if (!confirm(`確定刪除 ${filename}？`)) return;
   fetch(`/api/pcap/${encodeURIComponent(filename)}`, {method:'DELETE'}).then(()=>loadPcaps());
+}
+
+function reanalyzePcap(btn, filename) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+  fetch(`/api/pcap/${encodeURIComponent(filename)}/reanalyze`, {method:'POST'})
+    .then(r=>r.json())
+    .then(()=>{
+      // Poll until the watcher finishes (alert_count changes or 60 s pass)
+      let tries = 0;
+      const timer = setInterval(()=>{
+        tries++;
+        fetch('/api/pcap').then(r=>r.json()).then(files=>{
+          const f = files.find(x=>x.filename===filename);
+          if (tries >= 30 || f) {
+            clearInterval(timer);
+            btn.disabled = false;
+            btn.innerHTML = '<i class="bi bi-arrow-repeat"></i>';
+            loadPcaps();
+          }
+        });
+      }, 2000);
+    })
+    .catch(()=>{ btn.disabled=false; btn.innerHTML='<i class="bi bi-arrow-repeat"></i>'; });
 }
 
 function toggleAll(chk) {
