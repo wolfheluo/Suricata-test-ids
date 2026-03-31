@@ -125,7 +125,7 @@ def api_alert_preview(alert_id):
         return jsonify({"packets": ""})
     r = subprocess.run(
         [config.TSHARK_BIN, "-r", path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
     )
     return jsonify({"packets": r.stdout[:30_000]})
 
@@ -139,7 +139,7 @@ def api_alert_hexdump(alert_id):
         return jsonify({"hexdump": ""})
     r = subprocess.run(
         [config.TSHARK_BIN, "-r", path, "-x"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
     )
     return jsonify({"hexdump": r.stdout[:50_000]})
 
@@ -179,7 +179,7 @@ def api_pcap_preview(filename):
         abort(404)
     r = subprocess.run(
         [config.TSHARK_BIN, "-r", path],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
     )
     return jsonify({"packets": r.stdout[:30_000]})
 
@@ -231,7 +231,7 @@ def api_interfaces():
     try:
         r = subprocess.run(
             [config.DUMPCAP_BIN, "-D"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         interfaces = []
         for line in r.stdout.splitlines():
