@@ -44,6 +44,19 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS traffic_flows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_pcap TEXT,
+    src_ip      TEXT,
+    dst_ip      TEXT,
+    proto       TEXT,
+    bytes       INTEGER DEFAULT 0,
+    pkts        INTEGER DEFAULT 0,
+    country_src TEXT,
+    country_dst TEXT,
+    created_at  TEXT DEFAULT (datetime('now','localtime'))
+);
+
 INSERT OR IGNORE INTO settings VALUES ('interface',              '');
 INSERT OR IGNORE INTO settings VALUES ('capture_filesize_kb',   '204800');
 INSERT OR IGNORE INTO settings VALUES ('max_capture_files',     '10');
@@ -194,17 +207,58 @@ def get_severity_distribution():
     return [dict(r) for r in rows]
 
 
-def get_topn(dimension: str, n: int = 10, hours: int = 24):
-    allowed = {"src_ip", "dst_ip", "dst_port", "signature_id", "country"}
-    if dimension not in allowed:
+def insert_flows_bulk(flows: list):
+    """Insert a list of flow dicts into traffic_flows."""
+    if not flows:
+        return
+    with _lock, _conn() as c:
+        c.executemany(
+            """INSERT INTO traffic_flows
+               (source_pcap, src_ip, dst_ip, proto, bytes, pkts, country_src, country_dst)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    f.get("source_pcap"), f.get("src_ip"), f.get("dst_ip"),
+                    f.get("proto"), f.get("bytes", 0), f.get("pkts", 0),
+                    f.get("country_src"), f.get("country_dst"),
+                )
+                for f in flows
+            ],
+        )
+
+
+def delete_flows_by_source(source_pcap: str):
+    """Delete all traffic_flows rows whose source_pcap matches."""
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM traffic_flows WHERE source_pcap=?", (source_pcap,))
+
+
+def get_topn(dimension: str, n: int = 10, hours: int = 0):
+    """
+    Query top-N from traffic_flows.
+    dimension: src_ip | dst_ip | proto | country_src | bytes
+    hours: 0 = all time (no filter); >0 = last N hours
+    """
+    if dimension == "bytes":
+        col, agg = "src_ip", "SUM(bytes)"
+    elif dimension in {"src_ip", "dst_ip", "proto", "country_src"}:
+        col, agg = dimension, "SUM(pkts)"
+    else:
         return []
-    cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    time_filter, params = "", []
+    if hours and hours > 0:
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        time_filter = "AND created_at >= ?"
+        params.append(cutoff)
+
     with _lock, _conn() as c:
         rows = c.execute(
-            f"""SELECT {dimension} AS label, SUM(hit_count) AS count
-                FROM alerts WHERE created_at >= ? AND {dimension} IS NOT NULL
-                GROUP BY {dimension} ORDER BY count DESC LIMIT ?""",
-            (cutoff, n),
+            f"""SELECT {col} AS label, {agg} AS count
+                FROM traffic_flows
+                WHERE {col} IS NOT NULL AND {col} != '' {time_filter}
+                GROUP BY {col} ORDER BY count DESC LIMIT ?""",
+            params + [n],
         ).fetchall()
     return [dict(r) for r in rows]
 

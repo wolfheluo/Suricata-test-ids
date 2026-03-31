@@ -134,9 +134,10 @@
         <span><i class="bi bi-bar-chart-fill"></i> Top 10</span>
         <select id="topnDim" class="form-select form-select-sm w-auto">
           <option value="src_ip">來源 IP</option>
-          <option value="dst_port">目的 Port</option>
-          <option value="country">來源國別</option>
-          <option value="signature_id">觸發規則</option>
+          <option value="dst_ip">目的 IP</option>
+          <option value="proto">協議</option>
+          <option value="country_src">來源國別</option>
+          <option value="bytes">流量（Top Talkers）</option>
         </select>
       </div>
       <div class="card-body"><canvas id="topnChart" height="180"></canvas></div>
@@ -320,9 +321,13 @@ function refreshSeverity() {
 
 function refreshTopN() {
   const dim = document.getElementById('topnDim').value;
-  fetch(`/api/topn?dim=${dim}&n=10&hours=24`).then(r => r.json()).then(data => {
+  fetch(`/api/topn?dim=${dim}&n=10&hours=0`).then(r => r.json()).then(data => {
+    const isBytes = (dim === 'bytes');
     topnChart.data.labels                    = data.map(d => d.label || 'N/A');
-    topnChart.data.datasets[0].data          = data.map(d => d.count);
+    topnChart.data.datasets[0].data          = isBytes
+      ? data.map(d => parseFloat((d.count / 1024).toFixed(1)))
+      : data.map(d => d.count);
+    topnChart.data.datasets[0].label         = isBytes ? 'KB' : '封包數';
     topnChart.update();
   });
 }

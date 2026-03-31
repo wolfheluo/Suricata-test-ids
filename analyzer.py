@@ -69,6 +69,9 @@ def analyze_pcap(pcap_path: str) -> bool:
 
     has_high = _check_high_priority(fast_log)
 
+    # Always extract full traffic stats from the PCAP (independent of alerts)
+    _extract_traffic_stats(pcap_path, os.path.basename(pcap_path))
+
     if not has_high:
         auto_delete = db.get_setting("auto_delete_clean_pcap", "0") == "1"
         if auto_delete:
@@ -216,6 +219,72 @@ def _extract_forensic(event: dict, source_pcap: str):
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
+    """
+    Use tshark to dump every IP packet's (src, dst, protocol, length),
+    aggregate into per-(src,dst,proto) flow rows, GeoIP-look them up,
+    and bulk-insert into traffic_flows.
+    """
+    cmd = [
+        config.TSHARK_BIN, "-r", pcap_path, "-n",
+        "-T", "fields",
+        "-e", "ip.src",
+        "-e", "ip.dst",
+        "-e", "_ws.col.Protocol",
+        "-e", "frame.len",
+        "-E", "separator=|",
+        "-E", "header=n",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300, check=False,
+            encoding="utf-8", errors="replace",
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        log.error("tshark traffic extraction failed: %s", e)
+        return
+
+    # Aggregate per (src_ip, dst_ip, proto)
+    from collections import defaultdict
+    agg = defaultdict(lambda: {"bytes": 0, "pkts": 0})
+    for line in result.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 4:
+            continue
+        src_ip = parts[0].strip()
+        dst_ip = parts[1].strip()
+        proto  = parts[2].strip() or "UNKNOWN"
+        try:
+            length = int(parts[3].strip())
+        except ValueError:
+            length = 0
+        if not src_ip or not dst_ip:
+            continue
+        key = (src_ip, dst_ip, proto)
+        agg[key]["bytes"] += length
+        agg[key]["pkts"]  += 1
+
+    if not agg:
+        log.info("tshark found no IP packets in %s", source_pcap_name)
+        return
+
+    flows = []
+    for (src_ip, dst_ip, proto), stats in agg.items():
+        flows.append({
+            "source_pcap": source_pcap_name,
+            "src_ip":      src_ip,
+            "dst_ip":      dst_ip,
+            "proto":       proto,
+            "bytes":       stats["bytes"],
+            "pkts":        stats["pkts"],
+            "country_src": geoip_service.lookup(src_ip),
+            "country_dst": geoip_service.lookup(dst_ip),
+        })
+
+    db.insert_flows_bulk(flows)
+    log.info("Stored %d traffic flows for %s", len(flows), source_pcap_name)
+
+
 def _save_source_pcap_to_library(pcap_path: str, alert_count: int):
     """Move the source PCAP to forensics/ and register it in the PCAP library."""
     basename  = os.path.basename(pcap_path)
@@ -295,6 +364,9 @@ def reanalyze_pcap(pcap_path: str) -> bool:
 
     if not has_high:
         log.info("Re-analyze: no Priority 1/2 alerts in %s", pcap_name)
+        # Refresh traffic stats for updated rule run
+        db.delete_flows_by_source(basename)
+        _extract_traffic_stats(pcap_path, basename)
         db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0)
         return False
 
@@ -303,5 +375,7 @@ def reanalyze_pcap(pcap_path: str) -> bool:
     for alert in alerts:
         _process_alert(alert, pcap_path)
 
+    db.delete_flows_by_source(basename)
+    _extract_traffic_stats(pcap_path, basename)
     db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), len(alerts))
     return True
