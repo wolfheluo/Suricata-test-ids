@@ -49,6 +49,7 @@ INSERT OR IGNORE INTO settings VALUES ('capture_filesize_kb',   '204800');
 INSERT OR IGNORE INTO settings VALUES ('max_capture_files',     '10');
 INSERT OR IGNORE INTO settings VALUES ('dedup_window_secs',     '60');
 INSERT OR IGNORE INTO settings VALUES ('capture_duration_secs', '0');
+INSERT OR IGNORE INTO settings VALUES ('auto_delete_clean_pcap', '0');
 """
 
 

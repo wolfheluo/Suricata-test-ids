@@ -56,6 +56,15 @@
           <input id="setDedup" type="number" class="form-control" value="60">
           <div class="form-text">同一 signature_id + 來源 IP 在窗口內只計 Hit Count</div>
         </div>
+        <div class="mb-3 d-flex justify-content-between align-items-center">
+          <div>
+            <label class="form-label mb-0">自動刪除無風險 PCAP</label>
+            <div class="form-text mt-0">分析後無 Priority 1/2 告警時直接刪除，不存入 PCAP 庫</div>
+          </div>
+          <div class="form-check form-switch ms-3">
+            <input class="form-check-input" type="checkbox" role="switch" id="setAutoDeleteClean" style="width:3em;height:1.5em">
+          </div>
+        </div>
         <button class="btn btn-primary w-100" onclick="saveSettings()">
           <i class="bi bi-floppy"></i> 儲存設定
         </button>
@@ -132,6 +141,7 @@ function loadSettings() {
     document.getElementById('setDuration').value = s.capture_duration_secs || 0;
     document.getElementById('setMaxFiles').value = s.max_capture_files || 10;
     document.getElementById('setDedup').value    = s.dedup_window_secs  || 60;
+    document.getElementById('setAutoDeleteClean').checked = s.auto_delete_clean_pcap === '1';
     const sel = document.getElementById('ifaceSelect');
     if (s.interface) {
       // Try to pre-select saved interface
@@ -146,10 +156,11 @@ function saveSettings() {
   fetch('/api/settings', {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
-      capture_filesize_kb:   document.getElementById('setFilesize').value,
-      capture_duration_secs: document.getElementById('setDuration').value,
-      max_capture_files:     document.getElementById('setMaxFiles').value,
-      dedup_window_secs:     document.getElementById('setDedup').value,
+      capture_filesize_kb:    document.getElementById('setFilesize').value,
+      capture_duration_secs:  document.getElementById('setDuration').value,
+      max_capture_files:      document.getElementById('setMaxFiles').value,
+      dedup_window_secs:      document.getElementById('setDedup').value,
+      auto_delete_clean_pcap: document.getElementById('setAutoDeleteClean').checked ? '1' : '0',
     })
   }).then(()=>showMsg('settingsMsg','設定已儲存','success'));
 }

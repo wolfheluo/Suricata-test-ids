@@ -4,6 +4,7 @@ analyzer.py – Runs Suricata in offline mode, checks fast.log for Priority 1/2,
 """
 import os
 import json
+import shutil
 import subprocess
 import logging
 from datetime import datetime
@@ -22,7 +23,8 @@ def analyze_pcap(pcap_path: str) -> bool:
     Analyze *pcap_path* with Suricata.
 
     Returns True  → high-priority alerts found (Priority 1 or 2).
-    Returns False → no high-priority alerts; source PCAP has been deleted.
+    Returns False → no high-priority alerts.
+    The source PCAP is always saved to the PCAP library after analysis.
     """
     pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
     log_dir   = os.path.join(config.LOGS_DIR, pcap_name)
@@ -36,8 +38,25 @@ def analyze_pcap(pcap_path: str) -> bool:
         cmd += ["-S", rules_file]
 
     log.info("Running: %s", " ".join(cmd))
+
+    # On Windows, Suricata's bundled DLLs and Npcap's wpcap.dll must be
+    # resolvable.  We prepend both directories to PATH and set cwd to the
+    # Suricata installation folder so the loader finds them.
+    env = os.environ.copy()
+    extra = os.pathsep.join(filter(None, [
+        config.SURICATA_DIR,
+        config.NPCAP_DIR if os.path.isdir(config.NPCAP_DIR) else "",
+    ]))
+    env["PATH"] = extra + os.pathsep + env.get("PATH", "")
+
     try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600, check=False,
+            cwd=config.SURICATA_DIR, env=env,
+        )
+        if result.returncode != 0:
+            log.warning("Suricata exited with code %d. stderr: %s",
+                        result.returncode, result.stderr[:500])
     except subprocess.TimeoutExpired:
         log.error("Suricata timed out on %s", pcap_path)
         return False
@@ -51,8 +70,13 @@ def analyze_pcap(pcap_path: str) -> bool:
     has_high = _check_high_priority(fast_log)
 
     if not has_high:
-        log.info("No Priority 1/2 alerts in %s – deleting PCAP.", pcap_name)
-        _safe_remove(pcap_path)
+        auto_delete = db.get_setting("auto_delete_clean_pcap", "0") == "1"
+        if auto_delete:
+            log.info("No Priority 1/2 alerts in %s – auto-delete enabled, removing.", pcap_name)
+            _safe_remove(pcap_path)
+        else:
+            log.info("No Priority 1/2 alerts in %s – saving to PCAP library.", pcap_name)
+            _save_source_pcap_to_library(pcap_path, alert_count=0)
         return False
 
     # Parse eve.json, store alerts, extract forensics
@@ -60,6 +84,9 @@ def analyze_pcap(pcap_path: str) -> bool:
     log.info("%d alerts found in %s", len(alerts), pcap_name)
     for alert in alerts:
         _process_alert(alert, pcap_path)
+
+    # Save the source PCAP to the library now that forensic extraction is complete
+    _save_source_pcap_to_library(pcap_path, alert_count=len(alerts))
 
     return True
 
@@ -188,6 +215,21 @@ def _extract_forensic(event: dict, source_pcap: str):
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _save_source_pcap_to_library(pcap_path: str, alert_count: int):
+    """Move the source PCAP to forensics/ and register it in the PCAP library."""
+    basename  = os.path.basename(pcap_path)
+    dest_path = os.path.join(config.FORENSICS_DIR, basename)
+    try:
+        if pcap_path != dest_path:
+            shutil.move(pcap_path, dest_path)
+        size = os.path.getsize(dest_path)
+        db.upsert_pcap(basename, dest_path, size, alert_count)
+        log.info("Source PCAP saved to library: %s (%d bytes, %d alerts)",
+                 basename, size, alert_count)
+    except OSError as e:
+        log.error("Failed to save source PCAP to library (%s): %s", basename, e)
+
 
 def _safe_remove(path: str):
     try:

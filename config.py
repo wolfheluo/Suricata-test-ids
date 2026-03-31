@@ -15,6 +15,11 @@ SURICATA_BIN = r"C:\Program Files\Suricata\suricata.exe"
 DUMPCAP_BIN  = r"C:\Program Files\Wireshark\dumpcap.exe"
 TSHARK_BIN   = r"C:\Program Files\Wireshark\tshark.exe"
 
+# Directory containing Suricata's bundled DLLs (derived from binary path)
+SURICATA_DIR = os.path.dirname(SURICATA_BIN)
+# Npcap DLL directory – required on Windows for Suricata to find wpcap.dll
+NPCAP_DIR    = r"C:\Windows\System32\Npcap"
+
 # ── Defaults (can be overridden via Settings UI → stored in SQLite) ────────
 DEFAULT_CAPTURE_FILESIZE_KB   = 204800  # 200 MB
 DEFAULT_MAX_CAPTURE_FILES     = 10      # keep at most N completed capture files

@@ -254,7 +254,7 @@ def api_interfaces():
 
 _SETTING_KEYS = [
     "interface", "capture_filesize_kb", "max_capture_files",
-    "dedup_window_secs", "capture_duration_secs",
+    "dedup_window_secs", "capture_duration_secs", "auto_delete_clean_pcap",
 ]
 
 @app.route("/api/settings", methods=["GET"])
