@@ -1,0 +1,15 @@
+GeoLite2-City.mmdb
+
+# Suricata rules (may contain patterns that trigger secret scanners)
+rules/
+
+# Runtime output
+captures/
+forensics/
+logs/
+*.db
+
+# Python
+venv/
+__pycache__/
+*.pyc

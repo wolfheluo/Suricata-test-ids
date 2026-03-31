@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}PCAP 管理 – Suricata IDS{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0"><i class="bi bi-file-earmark-zip-fill"></i> 取證 PCAP 管理</h5>
+  <div>
+    <button class="btn btn-sm btn-danger" onclick="batchDelete()"><i class="bi bi-trash"></i> 批次刪除</button>
+    <button class="btn btn-sm btn-outline-secondary" onclick="loadPcaps()"><i class="bi bi-arrow-clockwise"></i> 重整</button>
+  </div>
+</div>
+
+<!-- Storage info -->
+<div class="alert alert-secondary py-2 small" id="storageInfo"><i class="bi bi-hdd"></i> 計算中...</div>
+
+<!-- PCAP table -->
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-sm table-hover mb-0">
+      <thead class="table-dark">
+        <tr>
+          <th><input type="checkbox" id="chkAll" onclick="toggleAll(this)"></th>
+          <th>檔名</th><th>大小</th><th>告警數</th><th>建立時間</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="pcapBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Preview Modal -->
+<div class="modal fade" id="previewModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-eye"></i> PCAP 封包預覽</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body bg-dark">
+        <pre class="text-success small mb-0" id="previewContent" style="max-height:500px;overflow-y:auto">載入中...</pre>
+      </div>
+      <div class="modal-footer">
+        <a id="previewDownload" href="#" class="btn btn-primary"><i class="bi bi-download"></i> 下載</a>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function fmtSize(b) {
+  if (!b) return '0 B';
+  const k=1024, sizes=['B','KB','MB','GB'];
+  const i = Math.floor(Math.log(b)/Math.log(k));
+  return (b/Math.pow(k,i)).toFixed(1)+' '+sizes[i];
+}
+
+function loadPcaps() {
+  fetch('/api/pcap').then(r=>r.json()).then(files=>{
+    const tbody = document.getElementById('pcapBody');
+    tbody.innerHTML = '';
+    let total = 0;
+    files.forEach(f=>{
+      total += f.filesize||0;
+      tbody.innerHTML += `<tr>
+        <td><input type="checkbox" class="chk-file" value="${f.filename}"></td>
+        <td class="text-break small">${f.filename}</td>
+        <td>${fmtSize(f.filesize)}</td>
+        <td>${f.alert_count||0}</td>
+        <td class="small">${f.created_at||''}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-info py-0"   onclick="previewPcap('${f.filename}')"><i class="bi bi-eye"></i></button>
+          <a      class="btn btn-sm btn-outline-primary py-0" href="/api/pcap/${encodeURIComponent(f.filename)}/download"><i class="bi bi-download"></i></a>
+          <button class="btn btn-sm btn-outline-danger py-0"  onclick="deletePcap('${f.filename}')"><i class="bi bi-trash"></i></button>
+        </td>
+      </tr>`;
+    });
+    document.getElementById('storageInfo').innerHTML =
+      `<i class="bi bi-hdd"></i> 共 <b>${files.length}</b> 個取證 PCAP，總計 <b>${fmtSize(total)}</b>`;
+  });
+}
+
+function previewPcap(filename) {
+  document.getElementById('previewContent').textContent = '載入中...';
+  document.getElementById('previewDownload').href = `/api/pcap/${encodeURIComponent(filename)}/download`;
+  fetch(`/api/pcap/${encodeURIComponent(filename)}/preview`).then(r=>r.json()).then(d=>{
+    document.getElementById('previewContent').textContent = d.packets || '（無資料）';
+  });
+  new bootstrap.Modal(document.getElementById('previewModal')).show();
+}
+
+function deletePcap(filename) {
+  if (!confirm(`確定刪除 ${filename}？`)) return;
+  fetch(`/api/pcap/${encodeURIComponent(filename)}`, {method:'DELETE'}).then(()=>loadPcaps());
+}
+
+function toggleAll(chk) {
+  document.querySelectorAll('.chk-file').forEach(c=>c.checked=chk.checked);
+}
+
+function batchDelete() {
+  const names = [...document.querySelectorAll('.chk-file:checked')].map(c=>c.value);
+  if (!names.length) { alert('請先勾選要刪除的檔案'); return; }
+  if (!confirm(`確定刪除 ${names.length} 個檔案？`)) return;
+  fetch('/api/pcap/batch_delete', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({filenames: names})
+  }).then(()=>{ document.getElementById('chkAll').checked=false; loadPcaps(); });
+}
+
+loadPcaps();
+</script>
+{% endblock %}

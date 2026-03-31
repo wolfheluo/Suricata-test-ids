@@ -1,0 +1,214 @@
+{% extends "base.html" %}
+{% block title %}系統設定 – Suricata IDS{% endblock %}
+
+{% block content %}
+<div class="row g-3">
+
+  <!-- Capture Control -->
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-record-circle"></i> 封包側錄控制</div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label">網卡介面</label>
+          <div class="input-group">
+            <select id="ifaceSelect" class="form-select"></select>
+            <button class="btn btn-outline-secondary" onclick="loadInterfaces()"><i class="bi bi-arrow-clockwise"></i></button>
+          </div>
+          <div class="form-text">由 dumpcap -D 列出所有可用網卡</div>
+        </div>
+        <div class="row g-2 mb-3">
+          <div class="col">
+            <label class="form-label">輪替大小 (KB)</label>
+            <input id="setFilesize" type="number" class="form-control" value="204800">
+            <div class="form-text">204800 = 200 MB</div>
+          </div>
+          <div class="col">
+            <label class="form-label">強制輪替 (秒, 0=關閉)</label>
+            <input id="setDuration" type="number" class="form-control" value="0">
+          </div>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-success flex-fill" onclick="startCapture()">
+            <i class="bi bi-play-fill"></i> 開始側錄
+          </button>
+          <button class="btn btn-danger flex-fill" onclick="stopCapture()">
+            <i class="bi bi-stop-fill"></i> 停止側錄
+          </button>
+        </div>
+        <div id="captureMsg" class="mt-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Analysis Settings -->
+  <div class="col-md-6">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-sliders"></i> 分析與保留設定</div>
+      <div class="card-body">
+        <div class="mb-3">
+          <label class="form-label">側錄 PCAP 最大保留數量</label>
+          <input id="setMaxFiles" type="number" class="form-control" value="10">
+          <div class="form-text">超量時自動刪除最舊的已分析 PCAP（200MB × N）</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">告警去重時間窗口 (秒)</label>
+          <input id="setDedup" type="number" class="form-control" value="60">
+          <div class="form-text">同一 signature_id + 來源 IP 在窗口內只計 Hit Count</div>
+        </div>
+        <button class="btn btn-primary w-100" onclick="saveSettings()">
+          <i class="bi bi-floppy"></i> 儲存設定
+        </button>
+        <div id="settingsMsg" class="mt-2"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Rules Management -->
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-file-earmark-code"></i> 規則管理</div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-4">
+            <label class="form-label">上傳自訂規則 (.rules)</label>
+            <div class="input-group">
+              <input type="file" id="rulesFile" class="form-control" accept=".rules">
+              <button class="btn btn-outline-primary" onclick="uploadRules()"><i class="bi bi-upload"></i> 上傳</button>
+            </div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">從 Emerging Threats 更新規則</label>
+            <button class="btn btn-outline-warning w-100" onclick="updateRules()">
+              <i class="bi bi-cloud-download"></i> 線上更新 emerging-all.rules
+            </button>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">目前規則預覽</label>
+            <button class="btn btn-outline-secondary w-100" onclick="loadRulesPreview()">
+              <i class="bi bi-list"></i> 載入規則列表
+            </button>
+          </div>
+        </div>
+        <div id="rulesMsg" class="mt-2"></div>
+        <div id="rulesPreview" class="mt-3 d-none">
+          <div class="d-flex justify-content-between mb-1">
+            <span class="small fw-bold" id="rulesSummary"></span>
+            <div>
+              <button class="btn btn-sm btn-outline-secondary" onclick="loadRulesPreview(-1)">« 上頁</button>
+              <button class="btn btn-sm btn-outline-secondary" onclick="loadRulesPreview(1)">下頁 »</button>
+            </div>
+          </div>
+          <div style="max-height:300px;overflow-y:auto;background:#1e1e1e;border-radius:4px;padding:8px">
+            <pre class="text-light small mb-0" id="rulesList"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let rulesPage = 1;
+
+function loadInterfaces() {
+  fetch('/api/interfaces').then(r=>r.json()).then(data=>{
+    const sel = document.getElementById('ifaceSelect');
+    sel.innerHTML = '<option value="">-- 選擇網卡 --</option>';
+    (data||[]).forEach(i=>{
+      sel.innerHTML += `<option value="${i.index}">${i.name}</option>`;
+    });
+  }).catch(e=>{
+    alert('無法取得網卡列表，請確認 Wireshark (dumpcap) 已安裝。');
+  });
+}
+
+function loadSettings() {
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    document.getElementById('setFilesize').value = s.capture_filesize_kb || 204800;
+    document.getElementById('setDuration').value = s.capture_duration_secs || 0;
+    document.getElementById('setMaxFiles').value = s.max_capture_files || 10;
+    document.getElementById('setDedup').value    = s.dedup_window_secs  || 60;
+    const sel = document.getElementById('ifaceSelect');
+    if (s.interface) {
+      // Try to pre-select saved interface
+      for (const opt of sel.options) {
+        if (opt.value === s.interface) { opt.selected = true; break; }
+      }
+    }
+  });
+}
+
+function saveSettings() {
+  fetch('/api/settings', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      capture_filesize_kb:   document.getElementById('setFilesize').value,
+      capture_duration_secs: document.getElementById('setDuration').value,
+      max_capture_files:     document.getElementById('setMaxFiles').value,
+      dedup_window_secs:     document.getElementById('setDedup').value,
+    })
+  }).then(()=>showMsg('settingsMsg','設定已儲存','success'));
+}
+
+function startCapture() {
+  const iface = document.getElementById('ifaceSelect').value;
+  if (!iface) { showMsg('captureMsg','請選擇網卡','danger'); return; }
+  saveSettings();
+  fetch('/api/capture/start', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({interface: iface})
+  }).then(r=>r.json()).then(d=>{
+    if (d.ok) showMsg('captureMsg','側錄已啟動','success');
+    else showMsg('captureMsg', d.error||'啟動失敗','danger');
+  });
+}
+
+function stopCapture() {
+  fetch('/api/capture/stop', {method:'POST'}).then(()=>showMsg('captureMsg','側錄已停止','secondary'));
+}
+
+function uploadRules() {
+  const f = document.getElementById('rulesFile').files[0];
+  if (!f) return;
+  const fd = new FormData();
+  fd.append('file', f);
+  fetch('/api/rules/upload', {method:'POST', body:fd}).then(r=>r.json()).then(d=>{
+    if (d.ok) showMsg('rulesMsg', `上傳成功：${d.filename}`, 'success');
+    else showMsg('rulesMsg', d.error||'上傳失敗', 'danger');
+  });
+}
+
+function updateRules() {
+  showMsg('rulesMsg','下載中，請稍候...','info');
+  fetch('/api/rules/update', {method:'POST'}).then(r=>r.json()).then(d=>{
+    if (d.ok) showMsg('rulesMsg','規則更新成功','success');
+    else showMsg('rulesMsg', d.error, 'danger');
+  });
+}
+
+function loadRulesPreview(delta) {
+  if (delta) rulesPage = Math.max(1, rulesPage + delta);
+  fetch(`/api/rules?page=${rulesPage}&per_page=100`).then(r=>r.json()).then(d=>{
+    const totalPages = Math.ceil(d.total / d.per_page) || 1;
+    document.getElementById('rulesSummary').textContent =
+      `共 ${d.total} 條規則，第 ${rulesPage}/${totalPages} 頁`;
+    document.getElementById('rulesList').textContent =
+      (d.rules||[]).map(r=>(r.enabled?'':' #DISABLED# ')+r.text).join('\n');
+    document.getElementById('rulesPreview').classList.remove('d-none');
+  });
+}
+
+function showMsg(id, msg, type) {
+  document.getElementById(id).innerHTML =
+    `<div class="alert alert-${type} alert-dismissible py-1 small mb-0">${msg}
+     <button type="button" class="btn-close py-2" data-bs-dismiss="alert"></button></div>`;
+}
+
+loadInterfaces();
+loadSettings();
+</script>
+{% endblock %}

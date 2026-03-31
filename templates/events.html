@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}告警事件 – Suricata IDS{% endblock %}
+
+{% block content %}
+<!-- Filter Bar -->
+<div class="card mb-3">
+  <div class="card-body py-2">
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label class="form-label mb-0 small">嚴重性</label>
+        <select id="fSeverity" class="form-select form-select-sm">
+          <option value="">全部</option>
+          <option value="1">P1 緊急</option>
+          <option value="2">P2 高危</option>
+          <option value="3">P3 中危</option>
+        </select>
+      </div>
+      <div class="col-auto">
+        <label class="form-label mb-0 small">來源 IP</label>
+        <input id="fSrcIp" class="form-control form-control-sm" placeholder="1.2.3.4">
+      </div>
+      <div class="col-auto">
+        <label class="form-label mb-0 small">時間範圍</label>
+        <select id="fHours" class="form-select form-select-sm">
+          <option value="">全部</option>
+          <option value="1">最近 1h</option>
+          <option value="24" selected>最近 24h</option>
+          <option value="168">最近 7d</option>
+        </select>
+      </div>
+      <div class="col-auto">
+        <button class="btn btn-primary btn-sm" onclick="loadAlerts(1)"><i class="bi bi-search"></i> 查詢</button>
+      </div>
+      <div class="col-auto ms-auto small text-muted" id="alertCount"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Alert Table -->
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-sm table-hover mb-0" id="alertTable">
+      <thead class="table-dark">
+        <tr>
+          <th>時間</th><th>來源 IP</th><th>國別</th>
+          <th>目的 IP</th><th>Port</th>
+          <th>告警名稱</th><th>優先</th><th>Hit</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="alertBody"></tbody>
+    </table>
+  </div>
+  <div class="card-footer d-flex justify-content-between align-items-center">
+    <button class="btn btn-sm btn-outline-secondary" id="btnPrev" onclick="changePage(-1)">« 上頁</button>
+    <span id="pageInfo" class="small"></span>
+    <button class="btn btn-sm btn-outline-secondary" id="btnNext" onclick="changePage(1)">下頁 »</button>
+  </div>
+</div>
+
+<!-- Detail Modal -->
+<div class="modal fade" id="detailModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-exclamation-triangle-fill text-warning"></i> 告警詳情</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="detailInfo" class="mb-3"></div>
+        <ul class="nav nav-tabs" id="detailTabs">
+          <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabPreview">封包列表</button></li>
+          <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabHex">Hex Dump</button></li>
+        </ul>
+        <div class="tab-content border border-top-0 p-3 bg-dark">
+          <div class="tab-pane fade show active" id="tabPreview">
+            <pre class="text-success small mb-0" id="previewContent" style="max-height:400px;overflow-y:auto">點擊告警後載入...</pre>
+          </div>
+          <div class="tab-pane fade" id="tabHex">
+            <pre class="text-warning small mb-0" id="hexContent" style="max-height:400px;overflow-y:auto">載入中...</pre>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <a id="btnDownloadPcap" href="#" class="btn btn-primary d-none">
+          <i class="bi bi-download"></i> 下載 PCAP
+        </a>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">關閉</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SEVERITY_COLORS = {1:'danger',2:'warning',3:'secondary'};
+let currentPage = 1, totalPages = 1;
+
+function loadAlerts(page) {
+  currentPage = page;
+  const sev   = document.getElementById('fSeverity').value;
+  const ip    = document.getElementById('fSrcIp').value.trim();
+  const hours = document.getElementById('fHours').value;
+  let url = `/api/alerts?page=${page}&per_page=50`;
+  if (sev)   url += `&severity=${sev}`;
+  if (ip)    url += `&src_ip=${encodeURIComponent(ip)}`;
+  if (hours) url += `&hours=${hours}`;
+
+  fetch(url).then(r=>r.json()).then(d=>{
+    totalPages = Math.ceil(d.total / d.per_page) || 1;
+    document.getElementById('alertCount').textContent = `共 ${d.total} 筆`;
+    document.getElementById('pageInfo').textContent   = `第 ${currentPage} / ${totalPages} 頁`;
+    document.getElementById('btnPrev').disabled = currentPage <= 1;
+    document.getElementById('btnNext').disabled = currentPage >= totalPages;
+
+    const tbody = document.getElementById('alertBody');
+    tbody.innerHTML = '';
+    d.items.forEach(a => {
+      const p   = a.priority;
+      const cls = SEVERITY_COLORS[p] ? `table-${SEVERITY_COLORS[p]}` : '';
+      const ts  = (a.timestamp||'').substring(0,19).replace('T',' ');
+      tbody.innerHTML += `<tr class="${cls}">
+        <td class="small text-nowrap">${ts}</td>
+        <td>${a.src_ip||''}</td>
+        <td><span class="badge bg-secondary">${a.country||'N/A'}</span></td>
+        <td>${a.dst_ip||''}</td>
+        <td>${a.dst_port||''}</td>
+        <td class="text-truncate" style="max-width:250px" title="${a.signature||''}">${a.signature||''}</td>
+        <td><span class="badge bg-${SEVERITY_COLORS[p]||'secondary'}">P${p}</span></td>
+        <td>${a.hit_count||1}</td>
+        <td><button class="btn btn-xs btn-outline-primary btn-sm py-0" onclick="showDetail(${a.id})">
+          <i class="bi bi-zoom-in"></i></button></td>
+      </tr>`;
+    });
+  });
+}
+
+function changePage(delta) {
+  const np = currentPage + delta;
+  if (np >= 1 && np <= totalPages) loadAlerts(np);
+}
+
+function showDetail(id) {
+  fetch(`/api/alerts/${id}`).then(r=>r.json()).then(a=>{
+    const ts = (a.timestamp||'').substring(0,19).replace('T',' ');
+    document.getElementById('detailInfo').innerHTML = `
+      <div class="row g-2 small">
+        <div class="col-md-6"><b>時間：</b>${ts}</div>
+        <div class="col-md-6"><b>規則 ID：</b>${a.signature_id||''}</div>
+        <div class="col-12"><b>告警：</b>${a.signature||''}</div>
+        <div class="col-md-4"><b>來源：</b>${a.src_ip||''}:${a.src_port||''} <span class="badge bg-secondary">${a.country||'N/A'}</span></div>
+        <div class="col-md-4"><b>目的：</b>${a.dst_ip||''}:${a.dst_port||''}</div>
+        <div class="col-md-4"><b>協定：</b>${a.proto||''} &nbsp; <b>分類：</b>${a.category||''}</div>
+      </div>`;
+
+    const dlBtn = document.getElementById('btnDownloadPcap');
+    if (a.forensic_pcap) {
+      dlBtn.href = `/api/alerts/${id}/download`;
+      dlBtn.classList.remove('d-none');
+    } else {
+      dlBtn.classList.add('d-none');
+    }
+
+    document.getElementById('previewContent').textContent = '載入中...';
+    document.getElementById('hexContent').textContent     = '載入中...';
+
+    fetch(`/api/alerts/${id}/preview`).then(r=>r.json()).then(d=>{
+      document.getElementById('previewContent').textContent = d.packets || '（無封包資料）';
+    });
+    fetch(`/api/alerts/${id}/hexdump`).then(r=>r.json()).then(d=>{
+      document.getElementById('hexContent').textContent = d.hexdump || '（無 Hex 資料）';
+    });
+
+    new bootstrap.Modal(document.getElementById('detailModal')).show();
+  });
+}
+
+loadAlerts(1);
+</script>
+{% endblock %}
