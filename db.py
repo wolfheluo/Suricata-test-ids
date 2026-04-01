@@ -63,6 +63,7 @@ INSERT OR IGNORE INTO settings VALUES ('max_capture_files',     '10');
 INSERT OR IGNORE INTO settings VALUES ('dedup_window_secs',     '60');
 INSERT OR IGNORE INTO settings VALUES ('capture_duration_secs', '0');
 INSERT OR IGNORE INTO settings VALUES ('auto_delete_clean_pcap', '0');
+INSERT OR IGNORE INTO settings VALUES ('forensics_dir', '');
 """
 
 
@@ -89,6 +90,12 @@ def get_setting(key: str, default: str = "") -> str:
 def set_setting(key: str, value: str):
     with _lock, _conn() as c:
         c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+
+
+def get_forensics_dir() -> str:
+    """Return configured forensics directory; falls back to the compiled-in default."""
+    d = get_setting("forensics_dir", "").strip()
+    return d if d else config.FORENSICS_DIR
 
 
 # ── alerts ─────────────────────────────────────────────────────────────────

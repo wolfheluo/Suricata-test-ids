@@ -65,6 +65,12 @@
             <input class="form-check-input" type="checkbox" role="switch" id="setAutoDeleteClean" style="width:3em;height:1.5em">
           </div>
         </div>
+        <div class="mb-3">
+          <label class="form-label">Forensics 儲存路徑</label>
+          <input id="setForensicsDir" type="text" class="form-control"
+                 placeholder="留空使用預設路徑（程式目錄下的 forensics\\）">
+          <div class="form-text">須為絕對路徑，例如 <code>D:\forensics</code>。變更後立即生效（舊路徑中的檔案不會自動搬移）。</div>
+        </div>
         <button class="btn btn-primary w-100" onclick="saveSettings()">
           <i class="bi bi-floppy"></i> 儲存設定
         </button>
@@ -142,6 +148,7 @@ function loadSettings() {
     document.getElementById('setMaxFiles').value = s.max_capture_files || 10;
     document.getElementById('setDedup').value    = s.dedup_window_secs  || 60;
     document.getElementById('setAutoDeleteClean').checked = s.auto_delete_clean_pcap === '1';
+    document.getElementById('setForensicsDir').value = s.forensics_dir || '';
     const sel = document.getElementById('ifaceSelect');
     if (s.interface) {
       // Try to pre-select saved interface
@@ -161,8 +168,12 @@ function saveSettings() {
       max_capture_files:      document.getElementById('setMaxFiles').value,
       dedup_window_secs:      document.getElementById('setDedup').value,
       auto_delete_clean_pcap: document.getElementById('setAutoDeleteClean').checked ? '1' : '0',
+      forensics_dir:          document.getElementById('setForensicsDir').value.trim(),
     })
-  }).then(()=>showMsg('settingsMsg','設定已儲存','success'));
+  }).then(r=>r.json()).then(d=>{
+    if (d.ok) showMsg('settingsMsg','設定已儲存','success');
+    else showMsg('settingsMsg', d.error||'儲存失敗', 'danger');
+  });
 }
 
 function startCapture() {

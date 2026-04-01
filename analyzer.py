@@ -201,7 +201,7 @@ def _extract_forensic(event: dict, source_pcap: str):
     ts_clean  = ts[:19].replace(":", "").replace("T", "_").replace("-", "")
     src_clean = src_ip.replace(".", "_")
     out_name  = f"{ts_clean}_{src_clean}_{sig_id}.pcap"
-    out_path  = os.path.join(config.FORENSICS_DIR, out_name)
+    out_path  = os.path.join(db.get_forensics_dir(), out_name)
 
     cmd = [
         config.TSHARK_BIN, "-r", source_pcap,
@@ -291,7 +291,7 @@ def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
 def _save_source_pcap_to_library(pcap_path: str, alert_count: int):
     """Move the source PCAP to forensics/ and register it in the PCAP library."""
     basename  = os.path.basename(pcap_path)
-    dest_path = os.path.join(config.FORENSICS_DIR, basename)
+    dest_path = os.path.join(db.get_forensics_dir(), basename)
     try:
         if pcap_path != dest_path:
             shutil.move(pcap_path, dest_path)

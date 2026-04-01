@@ -29,10 +29,10 @@ _watcher = CaptureWatcher()
 
 
 def _startup():
-    for d in (config.CAPTURES_DIR, config.FORENSICS_DIR,
-              config.LOGS_DIR, config.RULES_DIR):
+    for d in (config.CAPTURES_DIR, config.LOGS_DIR, config.RULES_DIR):
         os.makedirs(d, exist_ok=True)
-    db.init_db()
+    db.init_db()                               # must come first – populates settings
+    os.makedirs(db.get_forensics_dir(), exist_ok=True)
     geoip_service.init_geoip()
     _watcher.start()
 
@@ -122,7 +122,7 @@ def api_alert_preview(alert_id):
     row = db.get_alert(alert_id)
     if not row or not row["forensic_pcap"]:
         return jsonify({"packets": ""})
-    path = os.path.join(config.FORENSICS_DIR, row["forensic_pcap"])
+    path = os.path.join(db.get_forensics_dir(), row["forensic_pcap"])
     if not os.path.exists(path):
         return jsonify({"packets": ""})
     r = subprocess.run(
@@ -136,7 +136,7 @@ def api_alert_hexdump(alert_id):
     row = db.get_alert(alert_id)
     if not row or not row["forensic_pcap"]:
         return jsonify({"hexdump": ""})
-    path = os.path.join(config.FORENSICS_DIR, row["forensic_pcap"])
+    path = os.path.join(db.get_forensics_dir(), row["forensic_pcap"])
     if not os.path.exists(path):
         return jsonify({"hexdump": ""})
     r = subprocess.run(
@@ -150,7 +150,7 @@ def api_alert_download(alert_id):
     row = db.get_alert(alert_id)
     if not row or not row["forensic_pcap"]:
         abort(404)
-    path = os.path.join(config.FORENSICS_DIR, row["forensic_pcap"])
+    path = os.path.join(db.get_forensics_dir(), row["forensic_pcap"])
     if not os.path.exists(path):
         abort(404)
     return send_file(path, as_attachment=True,
@@ -168,7 +168,7 @@ def api_pcap_list():
 @app.route("/api/pcap/<filename>/download")
 def api_pcap_download(filename):
     safe = os.path.basename(filename)          # prevent path traversal
-    path = os.path.join(config.FORENSICS_DIR, safe)
+    path = os.path.join(db.get_forensics_dir(), safe)
     if not os.path.exists(path):
         abort(404)
     return send_file(path, as_attachment=True, download_name=safe)
@@ -176,7 +176,7 @@ def api_pcap_download(filename):
 @app.route("/api/pcap/<filename>/preview")
 def api_pcap_preview(filename):
     safe = os.path.basename(filename)
-    path = os.path.join(config.FORENSICS_DIR, safe)
+    path = os.path.join(db.get_forensics_dir(), safe)
     if not os.path.exists(path):
         abort(404)
     r = subprocess.run(
@@ -188,7 +188,7 @@ def api_pcap_preview(filename):
 @app.route("/api/pcap/<filename>", methods=["DELETE"])
 def api_pcap_delete(filename):
     safe = os.path.basename(filename)
-    path = os.path.join(config.FORENSICS_DIR, safe)
+    path = os.path.join(db.get_forensics_dir(), safe)
     if os.path.exists(path):
         os.remove(path)
     db.delete_pcap(safe)
@@ -197,7 +197,7 @@ def api_pcap_delete(filename):
 @app.route("/api/pcap/<filename>/reanalyze", methods=["POST"])
 def api_pcap_reanalyze(filename):
     safe = os.path.basename(filename)
-    path = os.path.join(config.FORENSICS_DIR, safe)
+    path = os.path.join(db.get_forensics_dir(), safe)
     if not os.path.exists(path):
         abort(404)
     def _run():
@@ -210,7 +210,7 @@ def api_pcap_batch_delete():
     filenames = request.json.get("filenames", [])
     for filename in filenames:
         safe = os.path.basename(filename)
-        path = os.path.join(config.FORENSICS_DIR, safe)
+        path = os.path.join(db.get_forensics_dir(), safe)
         if os.path.exists(path):
             os.remove(path)
         db.delete_pcap(safe)
@@ -269,6 +269,7 @@ def api_interfaces():
 _SETTING_KEYS = [
     "interface", "capture_filesize_kb", "max_capture_files",
     "dedup_window_secs", "capture_duration_secs", "auto_delete_clean_pcap",
+    "forensics_dir",
 ]
 
 @app.route("/api/settings", methods=["GET"])
@@ -279,7 +280,16 @@ def api_settings_get():
 def api_settings_post():
     data = request.json or {}
     for k, v in data.items():
-        if k in _SETTING_KEYS:
+        if k not in _SETTING_KEYS:
+            continue
+        if k == "forensics_dir":
+            path = str(v).strip()
+            # Validate: must be an absolute path (or empty to use default)
+            if path and not os.path.isabs(path):
+                return jsonify({"error": "forensics_dir 必須為絕對路徑，例如 D:\\forensics"}), 400
+            db.set_setting(k, path)
+            os.makedirs(db.get_forensics_dir(), exist_ok=True)
+        else:
             db.set_setting(k, str(v))
     return jsonify({"ok": True})
 
