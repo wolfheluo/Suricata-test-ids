@@ -230,8 +230,9 @@ def api_capture_start():
     filesize_kb  = int(db.get_setting("capture_filesize_kb",
                                       str(config.DEFAULT_CAPTURE_FILESIZE_KB)))
     duration_secs = int(db.get_setting("capture_duration_secs", "0"))
+    exclude_ips   = data.get("exclude_ips", [])
     db.set_setting("interface", interface)
-    _watcher.start_capture(interface, filesize_kb, duration_secs)
+    _watcher.start_capture(interface, filesize_kb, duration_secs, exclude_ips)
     return jsonify({"ok": True})
 
 @app.route("/api/capture/stop", methods=["POST"])

@@ -9,6 +9,7 @@ import os
 import glob
 import queue
 import collections
+import ipaddress
 import subprocess
 import threading
 import logging
@@ -65,8 +66,8 @@ class CaptureWatcher:
         """Signal threads to stop (they are daemons so they die with the process)."""
         self._running = False
 
-    def start_capture(self, interface: str, filesize_kb: int = None, duration_secs: int = 0):
-        """Launch dumpcap on *interface*."""
+    def start_capture(self, interface: str, filesize_kb: int = None, duration_secs: int = 0, exclude_ips=None):
+        """Launch dumpcap on *interface*, optionally excluding a list of IPs via BPF filter."""
         self.stop_capture()
         if filesize_kb is None:
             filesize_kb = int(db.get_setting("capture_filesize_kb",
@@ -82,6 +83,21 @@ class CaptureWatcher:
         ]
         if duration_secs and duration_secs > 0:
             cmd += ["-b", f"duration:{duration_secs}"]
+
+        # Build BPF capture filter to exclude specified IPs (validated)
+        if exclude_ips:
+            valid_ips = []
+            for raw in exclude_ips:
+                ip = str(raw).strip()
+                try:
+                    ipaddress.ip_address(ip)
+                    valid_ips.append(ip)
+                except ValueError:
+                    log.warning("Skipping invalid exclude IP: %r", ip)
+            if valid_ips:
+                bpf = " and ".join(f"not host {ip}" for ip in valid_ips)
+                cmd += ["-f", bpf]
+                log.info("Capture filter: %s", bpf)
 
         log.info("Starting dumpcap: %s", " ".join(cmd))
         with self._lock:
