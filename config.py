@@ -27,6 +27,6 @@ DEFAULT_DEDUP_WINDOW_SECS     = 60      # alert de-dup window
 DEFAULT_CAPTURE_DURATION_SECS = 0       # 0 = size-only rotation
 
 # ── Flask ──────────────────────────────────────────────────────────────────
-FLASK_HOST = "127.0.0.1"
+FLASK_HOST = "0.0.0.0"
 FLASK_PORT = 5000
 SECRET_KEY = secrets.token_hex(32)
