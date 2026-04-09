@@ -4,7 +4,12 @@
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h5 class="mb-0"><i class="bi bi-file-earmark-zip-fill"></i> 取證 PCAP 管理</h5>
-  <div>
+  <div class="d-flex gap-2">
+    <select id="fType" class="form-select form-select-sm" onchange="loadPcaps()" style="width:auto">
+      <option value="">全部類型</option>
+      <option value="source">原始捕獲</option>
+      <option value="forensic">取證提取</option>
+    </select>
     <button class="btn btn-sm btn-danger" onclick="batchDelete()"><i class="bi bi-trash"></i> 批次刪除</button>
     <button class="btn btn-sm btn-outline-secondary" onclick="loadPcaps()"><i class="bi bi-arrow-clockwise"></i> 重整</button>
   </div>
@@ -20,7 +25,7 @@
       <thead class="table-dark">
         <tr>
           <th><input type="checkbox" id="chkAll" onclick="toggleAll(this)"></th>
-          <th>檔名</th><th>大小</th><th>告警數</th><th>建立時間</th><th>操作</th>
+          <th>類型</th><th>檔名</th><th>大小</th><th>告警數</th><th>建立時間</th><th>操作</th>
         </tr>
       </thead>
       <tbody id="pcapBody"></tbody>
@@ -58,14 +63,21 @@ function fmtSize(b) {
 }
 
 function loadPcaps() {
+  const typeFilter = document.getElementById('fType').value;
   fetch('/api/pcap').then(r=>r.json()).then(files=>{
     const tbody = document.getElementById('pcapBody');
     tbody.innerHTML = '';
-    let total = 0;
+    let total = 0, shown = 0;
     files.forEach(f=>{
+      if (typeFilter && f.pcap_type !== typeFilter) return;
       total += f.filesize||0;
+      shown++;
+      const typeBadge = f.pcap_type === 'forensic'
+        ? '<span class="badge bg-danger">取證</span>'
+        : '<span class="badge bg-primary">原始</span>';
       tbody.innerHTML += `<tr>
         <td><input type="checkbox" class="chk-file" value="${f.filename}"></td>
+        <td>${typeBadge}</td>
         <td class="text-break small">${f.filename}</td>
         <td>${fmtSize(f.filesize)}</td>
         <td>${f.alert_count||0}</td>
@@ -79,7 +91,7 @@ function loadPcaps() {
       </tr>`;
     });
     document.getElementById('storageInfo').innerHTML =
-      `<i class="bi bi-hdd"></i> 共 <b>${files.length}</b> 個取證 PCAP，總計 <b>${fmtSize(total)}</b>`;
+      `<i class="bi bi-hdd"></i> 共 <b>${shown}</b> 個 PCAP（原始 + 取證），總計 <b>${fmtSize(total)}</b>`;
   });
 }
 

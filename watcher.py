@@ -256,10 +256,11 @@ class CaptureWatcher:
             f for f in glob.glob(os.path.join(config.CAPTURES_DIR, "*.pcap"))
             if os.path.isfile(f)
         )
-        # Keep at most max_files (exclude the one dumpcap is writing)
-        keep_files = files if not self.is_capturing() else files[:-1]
-        excess     = len(keep_files) - max_files
-        for f in keep_files[:max_files if excess > 0 else 0]:
+        # Completed files: exclude the file dumpcap is actively writing
+        completed = files if not self.is_capturing() else files[:-1]
+        excess    = len(completed) - max_files
+        # Delete only the oldest `excess` files (files are sorted oldest-first)
+        for f in completed[:excess]:
             log.info("Retention: removing old capture %s", os.path.basename(f))
             try:
                 os.remove(f)

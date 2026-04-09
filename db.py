@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS pcap_files (
     filepath    TEXT    NOT NULL,
     filesize    INTEGER DEFAULT 0,
     alert_count INTEGER DEFAULT 0,
+    pcap_type   TEXT    DEFAULT 'source',
     created_at  TEXT    DEFAULT (datetime('now','localtime'))
 );
 
@@ -77,6 +78,11 @@ def _conn():
 def init_db():
     with _lock, _conn() as c:
         c.executescript(SCHEMA)
+        # Schema migrations for existing databases
+        try:
+            c.execute("ALTER TABLE pcap_files ADD COLUMN pcap_type TEXT DEFAULT 'source'")
+        except Exception:
+            pass  # Column already exists
 
 
 # ── settings ──────────────────────────────────────────────────────────────
@@ -117,6 +123,13 @@ def upsert_alert(a: dict) -> int:
                 "UPDATE alerts SET hit_count=hit_count+1, last_seen=? WHERE id=?",
                 (now, row["id"]),
             )
+            # Preserve forensic_pcap link if the original alert doesn't have one
+            if a.get("forensic_pcap"):
+                c.execute(
+                    """UPDATE alerts SET forensic_pcap=?
+                       WHERE id=? AND (forensic_pcap IS NULL OR forensic_pcap='')""",
+                    (a["forensic_pcap"], row["id"]),
+                )
             return row["id"]
         cur = c.execute(
             """INSERT INTO alerts
@@ -272,12 +285,18 @@ def get_topn(dimension: str, n: int = 10, hours: int = 0):
 
 # ── pcap_files ─────────────────────────────────────────────────────────────
 
-def upsert_pcap(filename: str, filepath: str, filesize: int, alert_count: int):
+def upsert_pcap(filename: str, filepath: str, filesize: int, alert_count: int,
+                pcap_type: str = "source"):
     with _lock, _conn() as c:
         c.execute(
-            """INSERT OR REPLACE INTO pcap_files (filename,filepath,filesize,alert_count)
-               VALUES (?,?,?,?)""",
-            (filename, filepath, filesize, alert_count),
+            """INSERT INTO pcap_files (filename, filepath, filesize, alert_count, pcap_type)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(filename) DO UPDATE SET
+                   filepath=excluded.filepath,
+                   filesize=excluded.filesize,
+                   alert_count=excluded.alert_count,
+                   pcap_type=excluded.pcap_type""",
+            (filename, filepath, filesize, alert_count, pcap_type),
         )
 
 
@@ -298,3 +317,14 @@ def delete_alerts_by_source(source_pcap: str):
     """Delete all alerts whose source_pcap matches *source_pcap* (basename)."""
     with _lock, _conn() as c:
         c.execute("DELETE FROM alerts WHERE source_pcap=?", (source_pcap,))
+
+
+def get_forensic_pcaps_by_source(source_pcap: str) -> list:
+    """Return a list of forensic PCAP filenames linked to *source_pcap*."""
+    with _lock, _conn() as c:
+        rows = c.execute(
+            """SELECT DISTINCT forensic_pcap FROM alerts
+               WHERE source_pcap=? AND forensic_pcap IS NOT NULL AND forensic_pcap!=''""",
+            (source_pcap,),
+        ).fetchall()
+    return [r["forensic_pcap"] for r in rows]

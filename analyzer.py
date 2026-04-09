@@ -155,7 +155,7 @@ def _process_alert(event: dict, source_pcap: str):
 
     if forensic_path and os.path.exists(forensic_path):
         size = os.path.getsize(forensic_path)
-        db.upsert_pcap(forensic_name, forensic_path, size, 1)
+        db.upsert_pcap(forensic_name, forensic_path, size, 1, pcap_type="forensic")
 
 
 def _store_alert(event: dict, source_pcap: str, forensic_pcap) -> int:
@@ -296,7 +296,7 @@ def _save_source_pcap_to_library(pcap_path: str, alert_count: int):
         if pcap_path != dest_path:
             shutil.move(pcap_path, dest_path)
         size = os.path.getsize(dest_path)
-        db.upsert_pcap(basename, dest_path, size, alert_count)
+        db.upsert_pcap(basename, dest_path, size, alert_count, pcap_type="source")
         log.info("Source PCAP saved to library: %s (%d bytes, %d alerts)",
                  basename, size, alert_count)
     except OSError as e:
@@ -326,6 +326,15 @@ def reanalyze_pcap(pcap_path: str) -> bool:
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
+
+    # Remove old forensic extractions linked to this source PCAP
+    old_forensics = db.get_forensic_pcaps_by_source(basename)
+    for fname in old_forensics:
+        fpath = os.path.join(db.get_forensics_dir(), fname)
+        if os.path.exists(fpath):
+            _safe_remove(fpath)
+        db.delete_pcap(fname)
+        log.info("Removed old forensic PCAP: %s", fname)
 
     # Remove old alerts for this PCAP
     db.delete_alerts_by_source(basename)
@@ -373,7 +382,7 @@ def reanalyze_pcap(pcap_path: str) -> bool:
         # Refresh traffic stats for updated rule run
         db.delete_flows_by_source(basename)
         _extract_traffic_stats(pcap_path, basename)
-        db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0)
+        db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0, pcap_type="source")
         return False
 
     alerts = _parse_eve_json(eve_log)
@@ -383,5 +392,5 @@ def reanalyze_pcap(pcap_path: str) -> bool:
 
     db.delete_flows_by_source(basename)
     _extract_traffic_stats(pcap_path, basename)
-    db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), len(alerts))
+    db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), len(alerts), pcap_type="source")
     return True
