@@ -3,11 +3,12 @@ import secrets
 
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 CAPTURES_DIR  = os.path.join(BASE_DIR, "captures")
-FORENSICS_DIR = os.path.join(BASE_DIR, "forensics")
-LOGS_DIR      = os.path.join(BASE_DIR, "logs")
 RULES_DIR     = os.path.join(BASE_DIR, "rules")
-DB_PATH       = os.path.join(BASE_DIR, "suricata_ids.db")
 GEOIP_DB      = os.path.join(BASE_DIR, "GeoLite2-City.mmdb")
+
+# ── Project-based file storage (replaces SQLite) ──────────────────────────
+PROJECTS_DIR  = os.path.join(BASE_DIR, "projects")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
 
 # ── Binaries ──────────────────────────────────────────────────────────────
 # Adjust these paths if Wireshark / Suricata are installed elsewhere

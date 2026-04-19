@@ -1,330 +1,485 @@
 """
-db.py – SQLite helper (thread-safe via check_same_thread=False + a module lock).
+db.py – File-based storage (JSON) replacing SQLite.
+
+Directory layout
+────────────────
+projects/
+  index.json                   <- [{id, name, description, created_at}, ...]
+  <project_name>/
+    sources/                   <- source PCAPs captured by dumpcap
+    forensics/                 <- tshark-extracted forensic PCAPs
+    logs/
+      <pcap_name>/
+        eve.json               <- raw Suricata output
+        fast.log
+    analysis_summary.json      <- {alerts: [...], pcap_files: [...]}
+    traffic_flows.json         <- [{...}, ...]
+    merged_fast.log            <- all fast.log entries appended
+
+settings.json                  <- global key/value settings
 """
-import sqlite3
+
+import json
+import os
+import shutil
 import threading
+from collections import defaultdict
 from datetime import datetime, timedelta
+
 import config
 
 _lock = threading.Lock()
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS alerts (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp      TEXT    NOT NULL,
-    src_ip         TEXT,
-    dst_ip         TEXT,
-    src_port       INTEGER,
-    dst_port       INTEGER,
-    proto          TEXT,
-    signature_id   INTEGER,
-    signature      TEXT,
-    category       TEXT,
-    severity       INTEGER,
-    priority       INTEGER,
-    source_pcap    TEXT,
-    forensic_pcap  TEXT,
-    country        TEXT,
-    hit_count      INTEGER DEFAULT 1,
-    last_seen      TEXT,
-    created_at     TEXT    DEFAULT (datetime('now','localtime'))
-);
-
-CREATE TABLE IF NOT EXISTS pcap_files (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename    TEXT    NOT NULL UNIQUE,
-    filepath    TEXT    NOT NULL,
-    filesize    INTEGER DEFAULT 0,
-    alert_count INTEGER DEFAULT 0,
-    pcap_type   TEXT    DEFAULT 'source',
-    created_at  TEXT    DEFAULT (datetime('now','localtime'))
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS traffic_flows (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_pcap TEXT,
-    src_ip      TEXT,
-    dst_ip      TEXT,
-    proto       TEXT,
-    bytes       INTEGER DEFAULT 0,
-    pkts        INTEGER DEFAULT 0,
-    country_src TEXT,
-    country_dst TEXT,
-    created_at  TEXT DEFAULT (datetime('now','localtime'))
-);
-
-INSERT OR IGNORE INTO settings VALUES ('interface',              '');
-INSERT OR IGNORE INTO settings VALUES ('capture_filesize_kb',   '204800');
-INSERT OR IGNORE INTO settings VALUES ('max_capture_files',     '10');
-INSERT OR IGNORE INTO settings VALUES ('dedup_window_secs',     '60');
-INSERT OR IGNORE INTO settings VALUES ('capture_duration_secs', '0');
-INSERT OR IGNORE INTO settings VALUES ('auto_delete_clean_pcap', '0');
-INSERT OR IGNORE INTO settings VALUES ('forensics_dir', '');
-"""
+_SETTINGS_DEFAULTS = {
+    "interface":              "",
+    "capture_filesize_kb":   "204800",
+    "max_capture_files":     "10",
+    "dedup_window_secs":     "60",
+    "capture_duration_secs": "0",
+    "auto_delete_clean_pcap": "0",
+}
 
 
-def _conn():
-    c = sqlite3.connect(config.DB_PATH, check_same_thread=False)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    return c
+# -- file helpers ---------------------------------------------------------------
 
+def _atomic_write(path: str, data):
+    """Write JSON atomically: write to .tmp then os.replace."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+# -- init -----------------------------------------------------------------------
 
 def init_db():
-    with _lock, _conn() as c:
-        c.executescript(SCHEMA)
-        # Schema migrations for existing databases
-        try:
-            c.execute("ALTER TABLE pcap_files ADD COLUMN pcap_type TEXT DEFAULT 'source'")
-        except Exception:
-            pass  # Column already exists
+    os.makedirs(config.PROJECTS_DIR, exist_ok=True)
+    if not os.path.exists(config.SETTINGS_FILE):
+        _atomic_write(config.SETTINGS_FILE, _SETTINGS_DEFAULTS)
 
 
-# ── settings ──────────────────────────────────────────────────────────────
+# -- settings -------------------------------------------------------------------
 
 def get_setting(key: str, default: str = "") -> str:
-    with _lock, _conn() as c:
-        row = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
+    with _lock:
+        data = _read_json(config.SETTINGS_FILE, {})
+    v = data.get(key)
+    return str(v) if v is not None else default
 
 
 def set_setting(key: str, value: str):
-    with _lock, _conn() as c:
-        c.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value))
+    with _lock:
+        data = _read_json(config.SETTINGS_FILE, dict(_SETTINGS_DEFAULTS))
+        data[key] = value
+        _atomic_write(config.SETTINGS_FILE, data)
 
 
-def get_forensics_dir() -> str:
-    """Return configured forensics directory; falls back to the compiled-in default."""
-    d = get_setting("forensics_dir", "").strip()
-    return d if d else config.FORENSICS_DIR
+def get_forensics_dir(project_id: int = None) -> str:
+    """Return per-project forensics directory."""
+    if project_id:
+        p = get_project(project_id)
+        if p:
+            return os.path.join(config.PROJECTS_DIR, p["name"], "forensics")
+    return os.path.join(config.PROJECTS_DIR, "_unassigned", "forensics")
 
 
-# ── alerts ─────────────────────────────────────────────────────────────────
+# -- projects -------------------------------------------------------------------
+
+def _index_path() -> str:
+    return os.path.join(config.PROJECTS_DIR, "index.json")
+
+
+def _load_index() -> list:
+    return _read_json(_index_path(), [])
+
+
+def _save_index(projects: list):
+    _atomic_write(_index_path(), projects)
+
+
+def create_project(name: str, description: str = "") -> int:
+    name = name.strip()
+    with _lock:
+        projects = _load_index()
+        if any(p["name"] == name for p in projects):
+            raise ValueError(f"Project name '{name}' already exists")
+        next_id = max((p["id"] for p in projects), default=0) + 1
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        proj = {"id": next_id, "name": name,
+                "description": description.strip(), "created_at": now}
+        projects.append(proj)
+        _save_index(projects)
+
+        proj_dir = os.path.join(config.PROJECTS_DIR, name)
+        for sub in ("sources", "forensics", "logs"):
+            os.makedirs(os.path.join(proj_dir, sub), exist_ok=True)
+
+        _atomic_write(
+            os.path.join(proj_dir, "analysis_summary.json"),
+            {"id": next_id, "name": name, "created_at": now,
+             "alerts": [], "pcap_files": []},
+        )
+        _atomic_write(os.path.join(proj_dir, "traffic_flows.json"), [])
+        return next_id
+
+
+def list_projects() -> list:
+    with _lock:
+        return list(_load_index())
+
+
+def get_project(project_id: int):
+    with _lock:
+        projects = _load_index()
+    for p in projects:
+        if p["id"] == project_id:
+            return p
+    return None
+
+
+def delete_project(project_id: int):
+    with _lock:
+        projects = _load_index()
+        proj = next((p for p in projects if p["id"] == project_id), None)
+        if not proj:
+            return
+        _save_index([p for p in projects if p["id"] != project_id])
+        proj_dir = os.path.join(config.PROJECTS_DIR, proj["name"])
+        if os.path.exists(proj_dir):
+            shutil.rmtree(proj_dir)
+
+
+def get_project_dir(project_id: int) -> str:
+    p = get_project(project_id)
+    if not p:
+        return ""
+    return os.path.join(config.PROJECTS_DIR, p["name"])
+
+
+# -- per-project summary helpers ------------------------------------------------
+
+def _summary_path(project_id: int) -> str:
+    d = get_project_dir(project_id)
+    return os.path.join(d, "analysis_summary.json") if d else ""
+
+
+def _flows_path(project_id: int) -> str:
+    d = get_project_dir(project_id)
+    return os.path.join(d, "traffic_flows.json") if d else ""
+
+
+def _load_summary(project_id: int) -> dict:
+    path = _summary_path(project_id)
+    if not path:
+        return {"alerts": [], "pcap_files": []}
+    return _read_json(path, {"alerts": [], "pcap_files": []})
+
+
+def _save_summary(project_id: int, data: dict):
+    path = _summary_path(project_id)
+    if path:
+        _atomic_write(path, data)
+
+
+# -- alerts ---------------------------------------------------------------------
 
 def upsert_alert(a: dict) -> int:
-    """Insert a new alert or increment hit_count if duplicate within dedup window."""
-    window = int(get_setting("dedup_window_secs", "60"))
-    cutoff = (datetime.now() - timedelta(seconds=window)).strftime("%Y-%m-%d %H:%M:%S")
-    with _lock, _conn() as c:
-        row = c.execute(
-            """SELECT id FROM alerts
-               WHERE signature_id=? AND src_ip=? AND last_seen >= ?
-               ORDER BY id DESC LIMIT 1""",
-            (a.get("signature_id"), a.get("src_ip"), cutoff),
-        ).fetchone()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if row:
-            c.execute(
-                "UPDATE alerts SET hit_count=hit_count+1, last_seen=? WHERE id=?",
-                (now, row["id"]),
-            )
-            # Preserve forensic_pcap link if the original alert doesn't have one
-            if a.get("forensic_pcap"):
-                c.execute(
-                    """UPDATE alerts SET forensic_pcap=?
-                       WHERE id=? AND (forensic_pcap IS NULL OR forensic_pcap='')""",
-                    (a["forensic_pcap"], row["id"]),
-                )
-            return row["id"]
-        cur = c.execute(
-            """INSERT INTO alerts
-               (timestamp,src_ip,dst_ip,src_port,dst_port,proto,
-                signature_id,signature,category,severity,priority,
-                source_pcap,forensic_pcap,country,last_seen)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                a.get("timestamp", now), a.get("src_ip"), a.get("dst_ip"),
-                a.get("src_port"), a.get("dst_port"), a.get("proto"),
-                a.get("signature_id"), a.get("signature"), a.get("category"),
-                a.get("severity"), a.get("priority"),
-                a.get("source_pcap"), a.get("forensic_pcap"), a.get("country"), now,
-            ),
-        )
-        return cur.lastrowid
+    project_id = a.get("project_id")
+    if not project_id:
+        return -1
+    window    = int(get_setting("dedup_window_secs", "60"))
+    cutoff_dt = datetime.now() - timedelta(seconds=window)
+    now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with _lock:
+        summary = _load_summary(project_id)
+        alerts  = summary.get("alerts", [])
+
+        for alert in reversed(alerts):
+            if (alert.get("signature_id") == a.get("signature_id")
+                    and alert.get("src_ip") == a.get("src_ip")):
+                try:
+                    ls = datetime.strptime(alert.get("last_seen", ""),
+                                           "%Y-%m-%d %H:%M:%S")
+                    if ls >= cutoff_dt:
+                        alert["hit_count"] = alert.get("hit_count", 1) + 1
+                        alert["last_seen"] = now
+                        if a.get("forensic_pcap") and not alert.get("forensic_pcap"):
+                            alert["forensic_pcap"] = a["forensic_pcap"]
+                        summary["alerts"] = alerts
+                        _save_summary(project_id, summary)
+                        return alert["id"]
+                except ValueError:
+                    pass
+
+        next_id = max((al["id"] for al in alerts), default=0) + 1
+        new_alert = {
+            "id":            next_id,
+            "project_id":    project_id,
+            "timestamp":     a.get("timestamp", now),
+            "src_ip":        a.get("src_ip"),
+            "dst_ip":        a.get("dst_ip"),
+            "src_port":      a.get("src_port"),
+            "dst_port":      a.get("dst_port"),
+            "proto":         a.get("proto"),
+            "signature_id":  a.get("signature_id"),
+            "signature":     a.get("signature"),
+            "category":      a.get("category"),
+            "severity":      a.get("severity"),
+            "priority":      a.get("priority"),
+            "source_pcap":   a.get("source_pcap"),
+            "forensic_pcap": a.get("forensic_pcap"),
+            "country":       a.get("country"),
+            "hit_count":     1,
+            "last_seen":     now,
+            "created_at":    now,
+        }
+        alerts.append(new_alert)
+        summary["alerts"] = alerts
+        _save_summary(project_id, summary)
+        return next_id
 
 
-def update_alert_forensic(alert_id: int, forensic_filename: str):
-    with _lock, _conn() as c:
-        c.execute(
-            "UPDATE alerts SET forensic_pcap=? WHERE id=?",
-            (forensic_filename, alert_id),
-        )
-
-
-def get_alerts(page=1, per_page=50, severity=None, src_ip=None, hours=None):
-    clauses, params = [], []
-    if severity:
-        clauses.append("severity=?"); params.append(int(severity))
-    if src_ip:
-        clauses.append("src_ip LIKE ?"); params.append(f"%{src_ip}%")
-    if hours:
-        cutoff = (datetime.now() - timedelta(hours=int(hours))).strftime("%Y-%m-%d %H:%M:%S")
-        clauses.append("created_at >= ?"); params.append(cutoff)
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    with _lock, _conn() as c:
-        total = c.execute(f"SELECT COUNT(*) FROM alerts {where}", params).fetchone()[0]
-        rows  = c.execute(
-            f"SELECT * FROM alerts {where} ORDER BY id DESC LIMIT ? OFFSET ?",
-            params + [per_page, (page - 1) * per_page],
-        ).fetchall()
-    return {"total": total, "page": page, "per_page": per_page,
-            "items": [dict(r) for r in rows]}
-
-
-def get_alert(alert_id: int):
-    with _lock, _conn() as c:
-        return c.execute("SELECT * FROM alerts WHERE id=?", (alert_id,)).fetchone()
-
-
-def get_dashboard_stats():
-    today = datetime.now().strftime("%Y-%m-%d")
-    with _lock, _conn() as c:
-        total   = c.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
-        today_n = c.execute(
-            "SELECT COUNT(*) FROM alerts WHERE created_at >= ?", (today,)
-        ).fetchone()[0]
-        p1      = c.execute(
-            "SELECT COUNT(*) FROM alerts WHERE priority=1 AND created_at >= ?", (today,)
-        ).fetchone()[0]
-        p2      = c.execute(
-            "SELECT COUNT(*) FROM alerts WHERE priority=2 AND created_at >= ?", (today,)
-        ).fetchone()[0]
-        recent  = c.execute(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    return {
-        "total_alerts":  total,
-        "today_alerts":  today_n,
-        "today_p1":      p1,
-        "today_p2":      p2,
-        "recent_alerts": [dict(r) for r in recent],
-    }
-
-
-def get_alert_timeseries(hours: int = 24):
-    cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-    with _lock, _conn() as c:
-        rows = c.execute(
-            """SELECT strftime('%Y-%m-%d %H:00', created_at) AS hour,
-                      COUNT(*) AS count
-               FROM alerts WHERE created_at >= ?
-               GROUP BY hour ORDER BY hour""",
-            (cutoff,),
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_severity_distribution():
-    with _lock, _conn() as c:
-        rows = c.execute(
-            "SELECT severity, COUNT(*) AS count FROM alerts GROUP BY severity"
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
-def insert_flows_bulk(flows: list):
-    """Insert a list of flow dicts into traffic_flows."""
-    if not flows:
+def update_alert_forensic(alert_id: int, forensic_filename: str,
+                          project_id: int = None):
+    if not project_id:
         return
-    with _lock, _conn() as c:
-        c.executemany(
-            """INSERT INTO traffic_flows
-               (source_pcap, src_ip, dst_ip, proto, bytes, pkts, country_src, country_dst)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            [
-                (
-                    f.get("source_pcap"), f.get("src_ip"), f.get("dst_ip"),
-                    f.get("proto"), f.get("bytes", 0), f.get("pkts", 0),
-                    f.get("country_src"), f.get("country_dst"),
-                )
-                for f in flows
-            ],
-        )
+    with _lock:
+        summary = _load_summary(project_id)
+        for alert in summary.get("alerts", []):
+            if alert["id"] == alert_id:
+                alert["forensic_pcap"] = forensic_filename
+                break
+        _save_summary(project_id, summary)
 
 
-def delete_flows_by_source(source_pcap: str):
-    """Delete all traffic_flows rows whose source_pcap matches."""
-    with _lock, _conn() as c:
-        c.execute("DELETE FROM traffic_flows WHERE source_pcap=?", (source_pcap,))
+def get_alerts(page=1, per_page=50, severity=None, src_ip=None,
+               hours=None, project_id=None):
+    if not project_id:
+        return {"total": 0, "page": page, "per_page": per_page, "items": []}
+    with _lock:
+        summary = _load_summary(project_id)
+    alerts = list(summary.get("alerts", []))
+
+    if severity:
+        alerts = [a for a in alerts if a.get("severity") == int(severity)]
+    if src_ip:
+        alerts = [a for a in alerts if src_ip in (a.get("src_ip") or "")]
+    if hours:
+        cutoff = (datetime.now() - timedelta(hours=int(hours))).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        alerts = [a for a in alerts if (a.get("created_at") or "") >= cutoff]
+
+    alerts.reverse()
+    total = len(alerts)
+    start = (page - 1) * per_page
+    return {"total": total, "page": page, "per_page": per_page,
+            "items": alerts[start: start + per_page]}
 
 
-def get_topn(dimension: str, n: int = 10, hours: int = 0):
-    """
-    Query top-N from traffic_flows.
-    dimension: src_ip | dst_ip | proto | country_src | bytes
-    hours: 0 = all time (no filter); >0 = last N hours
-    """
-    if dimension == "bytes":
-        col, agg = "src_ip", "SUM(bytes)"
-    elif dimension in {"src_ip", "dst_ip", "proto", "country_src"}:
-        col, agg = dimension, "SUM(pkts)"
-    else:
+def get_alert(alert_id: int, project_id: int = None):
+    if not project_id:
+        return None
+    with _lock:
+        summary = _load_summary(project_id)
+    for alert in summary.get("alerts", []):
+        if alert["id"] == alert_id:
+            return alert
+    return None
+
+
+def get_dashboard_stats(project_id: int = None):
+    if not project_id:
+        return {"total_alerts": 0, "today_alerts": 0,
+                "today_p1": 0, "today_p2": 0, "recent_alerts": []}
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _lock:
+        summary = _load_summary(project_id)
+    alerts  = summary.get("alerts", [])
+    total   = len(alerts)
+    today_n = sum(1 for a in alerts
+                  if (a.get("created_at") or "").startswith(today))
+    p1      = sum(1 for a in alerts if a.get("priority") == 1
+                  and (a.get("created_at") or "").startswith(today))
+    p2      = sum(1 for a in alerts if a.get("priority") == 2
+                  and (a.get("created_at") or "").startswith(today))
+    recent  = list(reversed(alerts))[:10]
+    return {"total_alerts": total, "today_alerts": today_n,
+            "today_p1": p1, "today_p2": p2, "recent_alerts": recent}
+
+
+def get_alert_timeseries(hours: int = 24, project_id: int = None):
+    if not project_id:
         return []
-
-    time_filter, params = "", []
-    if hours and hours > 0:
-        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-        time_filter = "AND created_at >= ?"
-        params.append(cutoff)
-
-    with _lock, _conn() as c:
-        rows = c.execute(
-            f"""SELECT {col} AS label, {agg} AS count
-                FROM traffic_flows
-                WHERE {col} IS NOT NULL AND {col} != '' {time_filter}
-                GROUP BY {col} ORDER BY count DESC LIMIT ?""",
-            params + [n],
-        ).fetchall()
-    return [dict(r) for r in rows]
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    with _lock:
+        summary = _load_summary(project_id)
+    alerts = [a for a in summary.get("alerts", [])
+              if (a.get("created_at") or "") >= cutoff]
+    hourly = defaultdict(int)
+    for a in alerts:
+        ts = a.get("created_at", "")
+        if ts:
+            hourly[ts[:13] + ":00"] += 1
+    return [{"hour": k, "count": v} for k, v in sorted(hourly.items())]
 
 
-# ── pcap_files ─────────────────────────────────────────────────────────────
-
-def upsert_pcap(filename: str, filepath: str, filesize: int, alert_count: int,
-                pcap_type: str = "source"):
-    with _lock, _conn() as c:
-        c.execute(
-            """INSERT INTO pcap_files (filename, filepath, filesize, alert_count, pcap_type)
-               VALUES (?,?,?,?,?)
-               ON CONFLICT(filename) DO UPDATE SET
-                   filepath=excluded.filepath,
-                   filesize=excluded.filesize,
-                   alert_count=excluded.alert_count,
-                   pcap_type=excluded.pcap_type""",
-            (filename, filepath, filesize, alert_count, pcap_type),
-        )
+def get_severity_distribution(project_id: int = None):
+    if not project_id:
+        return []
+    with _lock:
+        summary = _load_summary(project_id)
+    dist = defaultdict(int)
+    for a in summary.get("alerts", []):
+        sev = a.get("severity")
+        if sev:
+            dist[sev] += 1
+    return [{"severity": k, "count": v} for k, v in sorted(dist.items())]
 
 
-def get_pcaps():
-    with _lock, _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM pcap_files ORDER BY created_at DESC"
-        ).fetchall()
-    return [dict(r) for r in rows]
+def delete_alerts_by_source(source_pcap: str, project_id: int = None):
+    if not project_id:
+        return
+    with _lock:
+        summary = _load_summary(project_id)
+        summary["alerts"] = [a for a in summary.get("alerts", [])
+                              if a.get("source_pcap") != source_pcap]
+        _save_summary(project_id, summary)
 
 
-def delete_pcap(filename: str):
-    with _lock, _conn() as c:
-        c.execute("DELETE FROM pcap_files WHERE filename=?", (filename,))
+def get_forensic_pcaps_by_source(source_pcap: str,
+                                 project_id: int = None) -> list:
+    if not project_id:
+        return []
+    with _lock:
+        summary = _load_summary(project_id)
+    seen, result = set(), []
+    for a in summary.get("alerts", []):
+        fp = a.get("forensic_pcap")
+        if fp and a.get("source_pcap") == source_pcap and fp not in seen:
+            seen.add(fp)
+            result.append(fp)
+    return result
 
 
-def delete_alerts_by_source(source_pcap: str):
-    """Delete all alerts whose source_pcap matches *source_pcap* (basename)."""
-    with _lock, _conn() as c:
-        c.execute("DELETE FROM alerts WHERE source_pcap=?", (source_pcap,))
+# -- traffic flows --------------------------------------------------------------
+
+def insert_flows_bulk(flows: list, project_id: int = None):
+    if not flows or not project_id:
+        return
+    path = _flows_path(project_id)
+    if not path:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _lock:
+        existing = _read_json(path, [])
+        for f in flows:
+            f.setdefault("created_at", now)
+        existing.extend(flows)
+        _atomic_write(path, existing)
 
 
-def get_forensic_pcaps_by_source(source_pcap: str) -> list:
-    """Return a list of forensic PCAP filenames linked to *source_pcap*."""
-    with _lock, _conn() as c:
-        rows = c.execute(
-            """SELECT DISTINCT forensic_pcap FROM alerts
-               WHERE source_pcap=? AND forensic_pcap IS NOT NULL AND forensic_pcap!=''""",
-            (source_pcap,),
-        ).fetchall()
-    return [r["forensic_pcap"] for r in rows]
+def delete_flows_by_source(source_pcap: str, project_id: int = None):
+    if not project_id:
+        return
+    path = _flows_path(project_id)
+    if not path:
+        return
+    with _lock:
+        flows = _read_json(path, [])
+        flows = [f for f in flows if f.get("source_pcap") != source_pcap]
+        _atomic_write(path, flows)
+
+
+def get_topn(dimension: str, n: int = 10, hours: int = 0,
+             project_id: int = None):
+    if not project_id:
+        return []
+    path = _flows_path(project_id)
+    if not path:
+        return []
+    with _lock:
+        flows = _read_json(path, [])
+
+    if hours > 0:
+        cutoff = (datetime.now() - timedelta(hours=hours)).strftime(
+            "%Y-%m-%d %H:%M:%S")
+        flows = [f for f in flows if (f.get("created_at") or "") >= cutoff]
+
+    agg = defaultdict(int)
+    if dimension == "bytes":
+        for f in flows:
+            k = f.get("src_ip")
+            if k:
+                agg[k] += f.get("bytes", 0)
+    elif dimension in ("src_ip", "dst_ip", "proto", "country_src"):
+        for f in flows:
+            k = f.get(dimension)
+            if k:
+                agg[k] += f.get("pkts", 0)
+
+    top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:n]
+    return [{"label": k, "count": v} for k, v in top]
+
+
+# -- pcap_files -----------------------------------------------------------------
+
+def upsert_pcap(filename: str, filepath: str, filesize: int,
+                alert_count: int, pcap_type: str = "source",
+                project_id: int = None):
+    if not project_id:
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _lock:
+        summary = _load_summary(project_id)
+        pcaps   = summary.get("pcap_files", [])
+        for pcap in pcaps:
+            if pcap["filename"] == filename:
+                pcap["filepath"]    = filepath
+                pcap["filesize"]    = filesize
+                pcap["alert_count"] = alert_count
+                pcap["pcap_type"]   = pcap_type
+                summary["pcap_files"] = pcaps
+                _save_summary(project_id, summary)
+                return
+        pcaps.append({
+            "filename":    filename,
+            "filepath":    filepath,
+            "filesize":    filesize,
+            "alert_count": alert_count,
+            "pcap_type":   pcap_type,
+            "project_id":  project_id,
+            "created_at":  now,
+        })
+        summary["pcap_files"] = pcaps
+        _save_summary(project_id, summary)
+
+
+def get_pcaps(project_id: int = None):
+    if not project_id:
+        return []
+    with _lock:
+        summary = _load_summary(project_id)
+    return list(reversed(summary.get("pcap_files", [])))
+
+
+def delete_pcap(filename: str, project_id: int = None):
+    if not project_id:
+        return
+    with _lock:
+        summary = _load_summary(project_id)
+        summary["pcap_files"] = [p for p in summary.get("pcap_files", [])
+                                  if p["filename"] != filename]
+        _save_summary(project_id, summary)

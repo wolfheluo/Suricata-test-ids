@@ -2,6 +2,12 @@
 {% block title %}告警事件 – Suricata IDS{% endblock %}
 
 {% block content %}
+<!-- Project header -->
+<div class="d-flex align-items-center gap-2 mb-2">
+  <h5 class="mb-0"><i class="bi bi-exclamation-triangle-fill text-warning"></i> 告警事件</h5>
+  <span id="evProjectBadge" class="badge bg-primary"></span>
+</div>
+
 <!-- Filter Bar -->
 <div class="card mb-3">
   <div class="card-body py-2">
@@ -95,6 +101,13 @@
 <script>
 const SEVERITY_COLORS = {1:'danger',2:'warning',3:'secondary'};
 let currentPage = 1, totalPages = 1;
+
+// Show current project
+fetch('/api/projects/current').then(r=>r.json()).then(p=>{
+  const el = document.getElementById('evProjectBadge');
+  if (p && p.name) { el.textContent = p.name; }
+  else { el.textContent = '未選擇專案'; el.className = 'badge bg-secondary'; }
+});
 
 function loadAlerts(page) {
   currentPage = page;

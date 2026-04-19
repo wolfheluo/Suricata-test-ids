@@ -42,6 +42,9 @@ class CaptureWatcher:
         # Shared set: every PCAP path that has ever been queued for analysis
         self._queued: set = set()
 
+        # Current active project
+        self.current_project_id: int | None = None
+
         # Live traffic ring-buffer: deque of (timestamp_str, bytes_per_sec)
         self._traffic_lock    = threading.Lock()
         self._traffic_history: collections.deque = collections.deque(
@@ -141,6 +144,10 @@ class CaptureWatcher:
             return (self._dumpcap_proc is not None
                     and self._dumpcap_proc.poll() is None)
 
+    def set_project(self, project_id: int | None):
+        """Set the active project for all subsequent captures and analyses."""
+        self.current_project_id = project_id
+
     def is_analyzing(self) -> bool:
         return self._analyzing
 
@@ -196,7 +203,7 @@ class CaptureWatcher:
                 continue
             self._analyzing = True
             try:
-                analyzer.analyze_pcap(pcap_path)
+                analyzer.analyze_pcap(pcap_path, project_id=self.current_project_id)
                 self._enforce_capture_retention()
             except Exception as e:
                 log.error("Analysis error for %s: %s", pcap_path, e)

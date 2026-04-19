@@ -1,0 +1,8 @@
+{
+  "interface": "",
+  "capture_filesize_kb": "204800",
+  "max_capture_files": "10",
+  "dedup_window_secs": "60",
+  "capture_duration_secs": "0",
+  "auto_delete_clean_pcap": "0"
+}

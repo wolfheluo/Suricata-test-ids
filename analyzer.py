@@ -1,12 +1,22 @@
 """
-analyzer.py – Runs Suricata in offline mode, checks fast.log for Priority 1/2,
-              extracts forensic PCAPs via tshark, stores results in SQLite.
+analyzer.py - Runs Suricata offline, stores results in per-project folders.
+
+Project layout written by this module:
+  projects/<name>/
+    logs/<pcap_name>/eve.json   (Suricata raw output, copied here)
+    logs/<pcap_name>/fast.log
+    sources/<pcap>.pcap         (original captured PCAP)
+    forensics/<ts>_<ip>_<sid>.pcap
+    analysis_summary.json       (alerts + pcap_files index)
+    traffic_flows.json
+    merged_fast.log             (appended after every analysis)
 """
 import os
 import json
 import shutil
 import subprocess
 import logging
+from collections import defaultdict
 from datetime import datetime
 
 import config
@@ -16,23 +26,20 @@ import geoip_service
 log = logging.getLogger("analyzer")
 
 
-# ── Suricata runner ──────────────────────────────────────────────────────────
+# -- Suricata runner -----------------------------------------------------------
 
-def analyze_pcap(pcap_path: str) -> bool:
-    """
-    Analyze *pcap_path* with Suricata.
-
-    Returns True  → high-priority alerts found (Priority 1 or 2).
-    Returns False → no high-priority alerts.
-    The source PCAP is always saved to the PCAP library after analysis.
-    """
+def analyze_pcap(pcap_path: str, project_id: int = None) -> bool:
     pcap_name = os.path.splitext(os.path.basename(pcap_path))[0]
-    log_dir   = os.path.join(config.LOGS_DIR, pcap_name)
+
+    # Determine output dirs
+    if project_id:
+        proj_dir  = db.get_project_dir(project_id)
+        log_dir   = os.path.join(proj_dir, "logs", pcap_name)
+    else:
+        log_dir   = os.path.join(config.BASE_DIR, "logs", pcap_name)
     os.makedirs(log_dir, exist_ok=True)
 
     cmd = [config.SURICATA_BIN, "-r", pcap_path, "-l", log_dir, "-k", "none"]
-
-    # Append custom rules file if available
     rules_file = os.path.join(config.RULES_DIR, "emerging-all.rules")
     if os.path.exists(rules_file):
         cmd += ["-S", rules_file]
@@ -42,9 +49,6 @@ def analyze_pcap(pcap_path: str) -> bool:
 
     log.info("Running: %s", " ".join(cmd))
 
-    # On Windows, Suricata's bundled DLLs and Npcap's wpcap.dll must be
-    # resolvable.  We prepend both directories to PATH and set cwd to the
-    # Suricata installation folder so the loader finds them.
     env = os.environ.copy()
     extra = os.pathsep.join(filter(None, [
         config.SURICATA_DIR,
@@ -58,7 +62,7 @@ def analyze_pcap(pcap_path: str) -> bool:
             cwd=config.SURICATA_DIR, env=env,
         )
         if result.returncode != 0:
-            log.warning("Suricata exited with code %d. stderr: %s",
+            log.warning("Suricata exited %d. stderr: %s",
                         result.returncode, result.stderr[:500])
     except subprocess.TimeoutExpired:
         log.error("Suricata timed out on %s", pcap_path)
@@ -70,34 +74,50 @@ def analyze_pcap(pcap_path: str) -> bool:
     fast_log = os.path.join(log_dir, "fast.log")
     eve_log  = os.path.join(log_dir, "eve.json")
 
-    has_high = _check_high_priority(fast_log)
+    # Append fast.log lines to project-level merged_fast.log
+    if project_id:
+        _append_fast_log(fast_log, project_id)
 
-    # Always extract full traffic stats from the PCAP (independent of alerts)
-    _extract_traffic_stats(pcap_path, os.path.basename(pcap_path))
+    has_high = _check_high_priority(fast_log)
+    _extract_traffic_stats(pcap_path, os.path.basename(pcap_path),
+                           project_id=project_id)
 
     if not has_high:
         auto_delete = db.get_setting("auto_delete_clean_pcap", "0") == "1"
         if auto_delete:
-            log.info("No Priority 1/2 alerts in %s – auto-delete enabled, removing.", pcap_name)
+            log.info("No P1/P2 in %s - auto-delete enabled.", pcap_name)
             _safe_remove(pcap_path)
         else:
-            log.info("No Priority 1/2 alerts in %s – saving to PCAP library.", pcap_name)
-            _save_source_pcap_to_library(pcap_path, alert_count=0)
+            _save_source_pcap(pcap_path, alert_count=0, project_id=project_id)
         return False
 
-    # Parse eve.json, store alerts, extract forensics
     alerts = _parse_eve_json(eve_log)
-    log.info("%d alerts found in %s", len(alerts), pcap_name)
+    log.info("%d alerts in %s", len(alerts), pcap_name)
     for alert in alerts:
-        _process_alert(alert, pcap_path)
+        _process_alert(alert, pcap_path, project_id=project_id)
 
-    # Save the source PCAP to the library now that forensic extraction is complete
-    _save_source_pcap_to_library(pcap_path, alert_count=len(alerts))
-
+    _save_source_pcap(pcap_path, alert_count=len(alerts), project_id=project_id)
     return True
 
 
-# ── fast.log priority check ─────────────────────────────────────────────────
+# -- merged_fast.log -----------------------------------------------------------
+
+def _append_fast_log(fast_log_path: str, project_id: int):
+    if not os.path.exists(fast_log_path):
+        return
+    proj_dir = db.get_project_dir(project_id)
+    if not proj_dir:
+        return
+    merged = os.path.join(proj_dir, "merged_fast.log")
+    try:
+        with open(fast_log_path, "r", encoding="utf-8", errors="ignore") as src, \
+             open(merged, "a", encoding="utf-8") as dst:
+            dst.writelines(src)
+    except OSError as e:
+        log.warning("Could not append to merged_fast.log: %s", e)
+
+
+# -- priority check ------------------------------------------------------------
 
 def _check_high_priority(fast_log_path: str) -> bool:
     if not os.path.exists(fast_log_path):
@@ -112,7 +132,7 @@ def _check_high_priority(fast_log_path: str) -> bool:
     return False
 
 
-# ── eve.json parser ──────────────────────────────────────────────────────────
+# -- eve.json parser -----------------------------------------------------------
 
 def _parse_eve_json(eve_path: str) -> list:
     alerts = []
@@ -135,53 +155,55 @@ def _parse_eve_json(eve_path: str) -> list:
     return alerts
 
 
-# ── per-alert processing ─────────────────────────────────────────────────────
+# -- per-alert processing ------------------------------------------------------
 
-def _process_alert(event: dict, source_pcap: str):
+def _process_alert(event: dict, source_pcap: str, project_id: int = None):
     alert_obj = event.get("alert", {})
-    priority  = alert_obj.get("severity", 3)      # eve.json uses "severity" field
-    src_ip    = event.get("src_ip", "")
-    dst_ip    = event.get("dest_ip", "")
-
-    # Only extract forensics for Priority 1 or 2
+    priority  = alert_obj.get("severity", 3)
     if priority not in (1, 2):
-        _store_alert(event, source_pcap, forensic_pcap=None)
+        _store_alert(event, source_pcap, forensic_pcap=None,
+                     project_id=project_id)
         return
 
-    forensic_path = _extract_forensic(event, source_pcap)
+    forensic_path = _extract_forensic(event, source_pcap,
+                                       project_id=project_id)
     forensic_name = os.path.basename(forensic_path) if forensic_path else None
-
-    alert_id = _store_alert(event, source_pcap, forensic_pcap=forensic_name)
+    _store_alert(event, source_pcap, forensic_pcap=forensic_name,
+                 project_id=project_id)
 
     if forensic_path and os.path.exists(forensic_path):
-        size = os.path.getsize(forensic_path)
-        db.upsert_pcap(forensic_name, forensic_path, size, 1, pcap_type="forensic")
+        db.upsert_pcap(forensic_name, forensic_path,
+                       os.path.getsize(forensic_path), 1,
+                       pcap_type="forensic", project_id=project_id)
 
 
-def _store_alert(event: dict, source_pcap: str, forensic_pcap) -> int:
+def _store_alert(event: dict, source_pcap: str, forensic_pcap,
+                 project_id: int = None) -> int:
     alert_obj = event.get("alert", {})
     src_ip    = event.get("src_ip", "")
     return db.upsert_alert({
-        "timestamp":    event.get("timestamp", datetime.now().isoformat()),
-        "src_ip":       src_ip,
-        "dst_ip":       event.get("dest_ip"),
-        "src_port":     event.get("src_port"),
-        "dst_port":     event.get("dest_port"),
-        "proto":        event.get("proto"),
-        "signature_id": alert_obj.get("signature_id"),
-        "signature":    alert_obj.get("signature"),
-        "category":     alert_obj.get("category"),
-        "severity":     alert_obj.get("severity", 3),
-        "priority":     alert_obj.get("severity", 3),
-        "source_pcap":  os.path.basename(source_pcap),
+        "project_id":    project_id,
+        "timestamp":     event.get("timestamp", datetime.now().isoformat()),
+        "src_ip":        src_ip,
+        "dst_ip":        event.get("dest_ip"),
+        "src_port":      event.get("src_port"),
+        "dst_port":      event.get("dest_port"),
+        "proto":         event.get("proto"),
+        "signature_id":  alert_obj.get("signature_id"),
+        "signature":     alert_obj.get("signature"),
+        "category":      alert_obj.get("category"),
+        "severity":      alert_obj.get("severity", 3),
+        "priority":      alert_obj.get("severity", 3),
+        "source_pcap":   os.path.basename(source_pcap),
         "forensic_pcap": forensic_pcap,
-        "country":      geoip_service.lookup(src_ip),
+        "country":       geoip_service.lookup(src_ip),
     })
 
 
-# ── tshark forensic extraction ───────────────────────────────────────────────
+# -- tshark forensic extraction ------------------------------------------------
 
-def _extract_forensic(event: dict, source_pcap: str):
+def _extract_forensic(event: dict, source_pcap: str,
+                       project_id: int = None):
     src_ip   = event.get("src_ip", "")
     dst_ip   = event.get("dest_ip", "")
     src_port = event.get("src_port")
@@ -190,10 +212,11 @@ def _extract_forensic(event: dict, source_pcap: str):
     sig_id   = event.get("alert", {}).get("signature_id", 0)
     ts       = event.get("timestamp", datetime.now().isoformat())
 
-    # Build display filter (5-tuple conversation)
     if proto in ("tcp", "udp") and src_port and dst_port:
-        fwd = f"(ip.src=={src_ip} && ip.dst=={dst_ip} && {proto}.srcport=={src_port} && {proto}.dstport=={dst_port})"
-        rev = f"(ip.src=={dst_ip} && ip.dst=={src_ip} && {proto}.srcport=={dst_port} && {proto}.dstport=={src_port})"
+        fwd = (f"(ip.src=={src_ip} && ip.dst=={dst_ip}"
+               f" && {proto}.srcport=={src_port} && {proto}.dstport=={dst_port})")
+        rev = (f"(ip.src=={dst_ip} && ip.dst=={src_ip}"
+               f" && {proto}.srcport=={dst_port} && {proto}.dstport=={src_port})")
         display_filter = f"{fwd} || {rev}"
     else:
         display_filter = f"ip.addr=={src_ip} && ip.addr=={dst_ip}"
@@ -201,13 +224,13 @@ def _extract_forensic(event: dict, source_pcap: str):
     ts_clean  = ts[:19].replace(":", "").replace("T", "_").replace("-", "")
     src_clean = src_ip.replace(".", "_")
     out_name  = f"{ts_clean}_{src_clean}_{sig_id}.pcap"
-    out_path  = os.path.join(db.get_forensics_dir(), out_name)
 
-    cmd = [
-        config.TSHARK_BIN, "-r", source_pcap,
-        "-Y", display_filter,
-        "-w", out_path,
-    ]
+    forensics_dir = db.get_forensics_dir(project_id)
+    os.makedirs(forensics_dir, exist_ok=True)
+    out_path = os.path.join(forensics_dir, out_name)
+
+    cmd = [config.TSHARK_BIN, "-r", source_pcap,
+           "-Y", display_filter, "-w", out_path]
     try:
         subprocess.run(cmd, capture_output=True, timeout=120, check=False)
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
@@ -220,23 +243,16 @@ def _extract_forensic(event: dict, source_pcap: str):
     return None
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# -- traffic stats extraction --------------------------------------------------
 
-def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
-    """
-    Use tshark to dump every IP packet's (src, dst, protocol, length),
-    aggregate into per-(src,dst,proto) flow rows, GeoIP-look them up,
-    and bulk-insert into traffic_flows.
-    """
+def _extract_traffic_stats(pcap_path: str, source_pcap_name: str,
+                            project_id: int = None):
     cmd = [
         config.TSHARK_BIN, "-r", pcap_path, "-n",
         "-T", "fields",
-        "-e", "ip.src",
-        "-e", "ip.dst",
-        "-e", "_ws.col.Protocol",
-        "-e", "frame.len",
-        "-E", "separator=|",
-        "-E", "header=n",
+        "-e", "ip.src", "-e", "ip.dst",
+        "-e", "_ws.col.Protocol", "-e", "frame.len",
+        "-E", "separator=|", "-E", "header=n",
     ]
     try:
         result = subprocess.run(
@@ -247,8 +263,6 @@ def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
         log.error("tshark traffic extraction failed: %s", e)
         return
 
-    # Aggregate per (src_ip, dst_ip, proto)
-    from collections import defaultdict
     agg = defaultdict(lambda: {"bytes": 0, "pkts": 0})
     for line in result.stdout.splitlines():
         parts = line.split("|")
@@ -263,17 +277,14 @@ def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
             length = 0
         if not src_ip or not dst_ip:
             continue
-        key = (src_ip, dst_ip, proto)
-        agg[key]["bytes"] += length
-        agg[key]["pkts"]  += 1
+        agg[(src_ip, dst_ip, proto)]["bytes"] += length
+        agg[(src_ip, dst_ip, proto)]["pkts"]  += 1
 
     if not agg:
-        log.info("tshark found no IP packets in %s", source_pcap_name)
         return
 
-    flows = []
-    for (src_ip, dst_ip, proto), stats in agg.items():
-        flows.append({
+    flows = [
+        {
             "source_pcap": source_pcap_name,
             "src_ip":      src_ip,
             "dst_ip":      dst_ip,
@@ -282,25 +293,34 @@ def _extract_traffic_stats(pcap_path: str, source_pcap_name: str):
             "pkts":        stats["pkts"],
             "country_src": geoip_service.lookup(src_ip),
             "country_dst": geoip_service.lookup(dst_ip),
-        })
+        }
+        for (src_ip, dst_ip, proto), stats in agg.items()
+    ]
+    db.insert_flows_bulk(flows, project_id=project_id)
+    log.info("Stored %d flows for %s", len(flows), source_pcap_name)
 
-    db.insert_flows_bulk(flows)
-    log.info("Stored %d traffic flows for %s", len(flows), source_pcap_name)
 
+# -- move source PCAP into project sources/ ------------------------------------
 
-def _save_source_pcap_to_library(pcap_path: str, alert_count: int):
-    """Move the source PCAP to forensics/ and register it in the PCAP library."""
-    basename  = os.path.basename(pcap_path)
-    dest_path = os.path.join(db.get_forensics_dir(), basename)
+def _save_source_pcap(pcap_path: str, alert_count: int,
+                       project_id: int = None):
+    basename = os.path.basename(pcap_path)
+    if project_id:
+        dest_dir = os.path.join(db.get_project_dir(project_id), "sources")
+        os.makedirs(dest_dir, exist_ok=True)
+    else:
+        dest_dir = os.path.dirname(pcap_path)
+    dest_path = os.path.join(dest_dir, basename)
     try:
-        if pcap_path != dest_path:
+        if os.path.abspath(pcap_path) != os.path.abspath(dest_path):
             shutil.move(pcap_path, dest_path)
         size = os.path.getsize(dest_path)
-        db.upsert_pcap(basename, dest_path, size, alert_count, pcap_type="source")
-        log.info("Source PCAP saved to library: %s (%d bytes, %d alerts)",
+        db.upsert_pcap(basename, dest_path, size, alert_count,
+                       pcap_type="source", project_id=project_id)
+        log.info("Source PCAP -> sources/: %s (%d B, %d alerts)",
                  basename, size, alert_count)
     except OSError as e:
-        log.error("Failed to save source PCAP to library (%s): %s", basename, e)
+        log.error("Failed to save source PCAP (%s): %s", basename, e)
 
 
 def _safe_remove(path: str):
@@ -310,36 +330,34 @@ def _safe_remove(path: str):
         log.warning("Could not delete %s: %s", path, e)
 
 
-# ── re-analysis of an already-stored PCAP ─────────────────────────────────────
+# -- re-analysis ---------------------------------------------------------------
 
-def reanalyze_pcap(pcap_path: str) -> bool:
-    """
-    Re-analyze a PCAP that is already stored in forensics/.
-    Clears the old Suricata log directory and old DB alerts, then
-    runs a fresh Suricata analysis.  The file is NOT moved.
-    """
+def reanalyze_pcap(pcap_path: str, project_id: int = None) -> bool:
     basename  = os.path.basename(pcap_path)
     pcap_name = os.path.splitext(basename)[0]
-    log_dir   = os.path.join(config.LOGS_DIR, pcap_name)
 
-    # Start fresh: remove old Suricata output
+    if project_id:
+        proj_dir = db.get_project_dir(project_id)
+        log_dir  = os.path.join(proj_dir, "logs", pcap_name)
+    else:
+        log_dir = os.path.join(config.BASE_DIR, "logs", pcap_name)
+
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
-    # Remove old forensic extractions linked to this source PCAP
-    old_forensics = db.get_forensic_pcaps_by_source(basename)
+    old_forensics = db.get_forensic_pcaps_by_source(basename,
+                                                     project_id=project_id)
+    forensics_dir = db.get_forensics_dir(project_id)
     for fname in old_forensics:
-        fpath = os.path.join(db.get_forensics_dir(), fname)
+        fpath = os.path.join(forensics_dir, fname)
         if os.path.exists(fpath):
             _safe_remove(fpath)
-        db.delete_pcap(fname)
-        log.info("Removed old forensic PCAP: %s", fname)
+        db.delete_pcap(fname, project_id=project_id)
 
-    # Remove old alerts for this PCAP
-    db.delete_alerts_by_source(basename)
+    db.delete_alerts_by_source(basename, project_id=project_id)
+    db.delete_flows_by_source(basename, project_id=project_id)
 
-    # Build Suricata command (same logic as analyze_pcap)
     cmd = [config.SURICATA_BIN, "-r", pcap_path, "-l", log_dir, "-k", "none"]
     rules_file = os.path.join(config.RULES_DIR, "emerging-all.rules")
     if os.path.exists(rules_file):
@@ -347,8 +365,6 @@ def reanalyze_pcap(pcap_path: str) -> bool:
     local_rules = os.path.join(config.RULES_DIR, "local.rules")
     if os.path.exists(local_rules):
         cmd += ["-S", local_rules]
-
-    log.info("Re-analyzing: %s", " ".join(cmd))
 
     env = os.environ.copy()
     extra = os.pathsep.join(filter(None, [
@@ -358,39 +374,29 @@ def reanalyze_pcap(pcap_path: str) -> bool:
     env["PATH"] = extra + os.pathsep + env.get("PATH", "")
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600, check=False,
-            cwd=config.SURICATA_DIR, env=env,
-        )
-        if result.returncode != 0:
-            log.warning("Suricata exited with code %d. stderr: %s",
-                        result.returncode, result.stderr[:500])
-    except subprocess.TimeoutExpired:
-        log.error("Suricata timed out on %s", pcap_path)
-        return False
-    except FileNotFoundError:
-        log.error("Suricata binary not found: %s", config.SURICATA_BIN)
+        subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                       check=False, cwd=config.SURICATA_DIR, env=env)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        log.error("Suricata error during re-analyze: %s", e)
         return False
 
     fast_log = os.path.join(log_dir, "fast.log")
     eve_log  = os.path.join(log_dir, "eve.json")
 
+    if project_id:
+        _append_fast_log(fast_log, project_id)
+
     has_high = _check_high_priority(fast_log)
+    _extract_traffic_stats(pcap_path, basename, project_id=project_id)
 
     if not has_high:
-        log.info("Re-analyze: no Priority 1/2 alerts in %s", pcap_name)
-        # Refresh traffic stats for updated rule run
-        db.delete_flows_by_source(basename)
-        _extract_traffic_stats(pcap_path, basename)
-        db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0, pcap_type="source")
+        db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), 0,
+                       pcap_type="source", project_id=project_id)
         return False
 
     alerts = _parse_eve_json(eve_log)
-    log.info("Re-analyze: %d alerts found in %s", len(alerts), pcap_name)
     for alert in alerts:
-        _process_alert(alert, pcap_path)
-
-    db.delete_flows_by_source(basename)
-    _extract_traffic_stats(pcap_path, basename)
-    db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path), len(alerts), pcap_type="source")
+        _process_alert(alert, pcap_path, project_id=project_id)
+    db.upsert_pcap(basename, pcap_path, os.path.getsize(pcap_path),
+                   len(alerts), pcap_type="source", project_id=project_id)
     return True

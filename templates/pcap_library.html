@@ -3,7 +3,10 @@
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-3">
-  <h5 class="mb-0"><i class="bi bi-file-earmark-zip-fill"></i> 取證 PCAP 管理</h5>
+  <div class="d-flex align-items-center gap-2">
+    <h5 class="mb-0"><i class="bi bi-file-earmark-zip-fill"></i> 取證 PCAP 管理</h5>
+    <span id="pcapProjectBadge" class="badge bg-primary"></span>
+  </div>
   <div class="d-flex gap-2">
     <select id="fType" class="form-select form-select-sm" onchange="loadPcaps()" style="width:auto">
       <option value="">全部類型</option>
@@ -58,6 +61,13 @@
 function fmtSize(b) {
   if (!b) return '0 B';
   const k=1024, sizes=['B','KB','MB','GB'];
+
+// Show current project badge
+fetch('/api/projects/current').then(r=>r.json()).then(p=>{
+  const el = document.getElementById('pcapProjectBadge');
+  if (p && p.name) { el.textContent = p.name; }
+  else { el.textContent = '未選擇專案'; el.className = 'badge bg-secondary'; }
+});
   const i = Math.floor(Math.log(b)/Math.log(k));
   return (b/Math.pow(k,i)).toFixed(1)+' '+sizes[i];
 }
